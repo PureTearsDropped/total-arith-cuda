@@ -156,7 +156,24 @@ pretzel trajectory (3-D Lissajous), 6 gyro spikes, cascade position/attitude con
 
 Sharper lesson than demo 1: in 6-DoF, totalization alone is *not* enough — the arithmetic
 survives but the corrupted pose still diverges the controller. **The flags are the
-difference between surviving and completing the mission.** (This demo also caught a real
+difference between surviving and completing the mission.**
+
+**Speed envelope** (same script, `speed_sweep()`): how much does *better attitude control*
+buy? Adding differential-flatness feedforward (the trajectory's jerk tells you the body
+rates it will require — supply the future instead of reacting to the past):
+
+| trajectory speed | peak | PD feedback only | PD + flatness FF |
+|---|---|---|---|
+| ×1.0 (3.4 m/s, 0.6 g) | | 9.3 cm | **1.3 cm** |
+| ×2.0 (6.8 m/s, 2.3 g) | | 206 cm (lost) | **3.7 cm** |
+| ×2.5 (8.4 m/s, 3.5 g) | | 216 cm | **6.7 cm** |
+| ×3.5 (11.8 m/s, 6.9 g) | | ✗ diverges | 204 cm (still flying) |
+
+~50× precision at racing speeds and a ~2× larger flight envelope, from a few lines of
+feedforward. Honest note: through the *noisy estimator* at gentle speeds the same FF
+slightly *hurt* (0.059→0.083 m RMS — `w_des` inherits sensor noise), so the glitch demo
+keeps plain PD; the sweep isolates control performance on clean state. Tools belong to
+their regimes. (This demo also caught a real
 library bug — `group_mul` crashed on wiring tables with empty output rows, a shape that
 hypercomplex algebras never produce but matrix-vector wirings do. Fixed in both
 implementations.)
