@@ -115,6 +115,30 @@ the other factor's uncertainty vanishes, per `x×0=0` exact.
 
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
+### Demo — drone attitude control that survives sensor spikes (`demo_drone.py`)
+
+Quaternion attitude estimation (strapdown integration + normalization, quaternion product
+via `wiring_tensor('cd', 4)`) driving a PD-controlled rigid body, with rare huge gyro
+spikes (a model of real sensor glitches). The classic failure: `|q|²` overflows float32 →
+`inf` → normalization collapses → `0/0 = NaN` → control death.
+
+```
+python demo_drone.py        # 4 arms × 8 seeds  (CPU is fine — single quaternion per step)
+```
+
+Measured (5 spikes in 1500 steps, hover target):
+
+| arm | crashes | attitude error (median / worst) | spikes flagged | false pos |
+|---|---|---|---|---|
+| IEEE, no glitches (baseline) | 0/8 | 0.24° / 0.39° | — | — |
+| **IEEE float32** | **8/8** | — (all dead) | — | — |
+| total arithmetic (TOT) | 0/8 | 147.6° / 173.6° (airborne but lost) | 5/5 | 1 |
+| **TOT + flag rejection** | **0/8** | **0.29° / 0.54°** | 5/5 | **0** |
+
+Same two-layer structure as the gravity-law experiment in varpro-powersum-nn: totalization
+keeps the system alive; the flags name every poisoned sample, and rejecting them restores
+clean-baseline accuracy exactly.
+
 ### Julia port — `julia/TotalArith.jl`
 
 The same semantics in **generic Julia**: written against `AbstractArray` with only
