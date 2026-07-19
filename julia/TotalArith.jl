@@ -144,8 +144,14 @@ function group_mul(T::AbstractArray{Float32,3}, a::Tot, b::Tot)
     end
     val, sflag = _sat(raw)
     fin  = a.flag .| b.flag
-    anyf = any((fin .& (GE | LE)) .> 0, dims=2)     # components mix ⟹ conservative
-    f    = sflag .| (UInt8.(anyf) .* (GE | LE))
+    # Flag propagation (audit round 2 found SUNK was dropped; while fixing it, our own
+    # oracle ⑥ found more: **mere bounds (GE/LE) also invalidate the sign claim** — in a
+    # MAC, magnitude uncertainty shifts the cancellation balance and can flip the sign of
+    # the sum (e.g. 6−10 vs 6−2). ⟹ any flag on any input component drops the whole row
+    # to no-bound + SUNK (no magnitude, no sign claim). Exact interval propagation lives
+    # in the hardware bfp_sed implementation; this is the conservative GPU one.
+    anyflag = any(fin .> 0, dims=2)
+    f = sflag .| (UInt8.(anyflag) .* (GE | LE | SUNK))
     return Tot(val, f)
 end
 
@@ -281,6 +287,33 @@ function self_test()
     end
     println("  $(3K) flagged cases (true values sampled from admissible sets): lies $(lies5)")
     @assert lies5 == 0
+
+    println("="^72)
+    println("⑥ group_mul oracle (external AI audit round 2: SUNK propagation)")
+    println("="^72)
+    M6 = 4; T6 = wiring_tensor(:cd, M6)
+    KB = 10_000
+    Af, taf = rand_flagged(KB * M6); Bf, tbf = rand_flagged(KB * M6)
+    A6 = Tot(reshape(Af.val, KB, M6), reshape(Af.flag, KB, M6))
+    B6 = Tot(reshape(Bf.val, KB, M6), reshape(Bf.flag, KB, M6))
+    ta6 = reshape(taf, KB, M6); tb6 = reshape(tbf, KB, M6)
+    r6 = group_mul(T6, A6, B6)
+    t6 = similar(ta6)
+    for k in 1:M6
+        Tk = Float64.(@view T6[k, :, :])
+        t6[:, k] = sum((ta6 * Tk) .* tb6, dims=2)
+    end
+    ge = (r6.flag .& GE) .> 0; le = (r6.flag .& LE) .> 0; sk = (r6.flag .& SUNK) .> 0
+    vo = Float64.(r6.val); slack = 2.0^-20
+    lies6 = count(ge .& .!le .& (abs.(t6) .< abs.(vo) .* (1 - slack)))
+    lies6 += count(le .& .!ge .& (abs.(t6) .> abs.(vo) .* (1 + slack)))
+    lies6 += count(.!sk .& (vo .!= 0) .& (t6 .!= 0) .& (sign.(t6) .!= sign.(vo)))
+    lies6 += count(x -> isnan(x) || isinf(x), r6.val)
+    insunk = vec(any(((A6.flag .| B6.flag) .& SUNK) .> 0, dims=2))
+    sunk_ok = all((r6.flag[insunk, :] .& SUNK) .> 0)
+    println("  $(KB) rows × $(M6) components (quaternion, flagged): lies $(lies6), " *
+            "SUNK propagation $(sunk_ok ? "✓" : "✗")")
+    @assert lies6 == 0 && sunk_ok
 
     println()
     println("TotalArith.jl: totality (no NaN, honest flags) + wiring swap + " *

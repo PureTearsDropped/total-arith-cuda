@@ -155,9 +155,14 @@ def group_mul(T, a, b):
     raw = torch.einsum('kij,...i,...j->...k', T.double(), a.val.double(), b.val.double())
     val, sflag = _sat(raw, a.val.device)
     fin = (a.flag | b.flag)
-    anyf = (fin & (GE | LE)) > 0
-    anyf = anyf.any(dim=-1, keepdim=True).expand(sflag.shape)   # 成分間で 混ざる ⟹ 保守的
-    f = sflag | anyf.to(torch.uint8) * (GE | LE)
+    # フラグ伝播（外部AI監査 第2ラウンド 2026-07-19 で SUNK 落ちが 発覚 → 修正時に
+    # 自前オラクル⑥が さらに 発見: **境界(GE/LE)だけでも 符号主張は 落ちる**。
+    # 積和では 大きさの 不確かさが 項の 相殺バランスを 変え、和の 符号まで 反転しうる
+    # （例: 6−10 と 6−2）。⟹ 入力行に フラグが 一つでも あれば、行全体を
+    # 境界なし+SUNK に 落とす（大きさも 符号も 主張しない）。厳密な 区間伝播は
+    # ハードウェア版 bfp_sed が 持つ・ここは 保守的 GPU 実装。
+    anyflag = (fin > 0).any(dim=-1, keepdim=True).expand(sflag.shape)
+    f = sflag | anyflag.to(torch.uint8) * (GE | LE | SUNK)
     return Tot(val, f)
 
 
@@ -301,6 +306,32 @@ def self_test():
         lies5 += int(torch.isnan(r.val).sum() + torch.isinf(r.val).sum())
     print(f"  {3*K:,} 件: 嘘 **{lies5}**（片側境界・符号・無NaN の 三契約）")
     assert lies5 == 0
+
+    print()
+    print("=" * 76)
+    print("⑥ group_mul の オラクル検査（外部AI監査 第2ラウンド: SUNK 伝播の 指摘に 応答）")
+    print("=" * 76)
+    M6 = 4; T6 = wiring_tensor("cd", M6, dev)
+    KB = 20_000
+    def rand_flagged_mat(KB, M):
+        tt, tv = rand_flagged(KB * M)
+        m = Tot(tt.val.reshape(KB, M)); m.flag = tt.flag.reshape(KB, M)
+        return m, tv.reshape(KB, M)
+    A6, ta6 = rand_flagged_mat(KB, M6); B6, tb6 = rand_flagged_mat(KB, M6)
+    r6 = group_mul(T6, A6, B6)
+    t6 = torch.einsum('kij,bi,bj->bk', T6.double(), ta6, tb6)   # 真の配線積
+    ge = (r6.flag & GE) > 0; le = (r6.flag & LE) > 0; sk = (r6.flag & SUNK) > 0
+    vo = r6.val.double(); slack = 2.0 ** -20
+    lies6 = int((ge & ~le & (t6.abs() < vo.abs() * (1 - slack))).sum())
+    lies6 += int((le & ~ge & (t6.abs() > vo.abs() * (1 + slack))).sum())
+    lies6 += int(((~sk) & (vo != 0) & (t6 != 0)
+                  & (torch.sign(t6) != torch.sign(vo))).sum())
+    lies6 += int(torch.isnan(r6.val).sum() + torch.isinf(r6.val).sum())
+    # SUNK 伝播の 明示回帰: 入力行に SUNK が あれば 出力行 全成分に SUNK
+    insunk = (((A6.flag | B6.flag) & SUNK) > 0).any(dim=-1)
+    sunk_ok = bool(((r6.flag[insunk] & SUNK) > 0).all())
+    print(f"  {KB:,} 行 × {M6}成分（四元数・フラグ付き）: 嘘 **{lies6}**・SUNK伝播 {'✓' if sunk_ok else '×'}")
+    assert lies6 == 0 and sunk_ok
 
     print()
     print("GPU 版: 全域算術（無NaN・フラグ）+ 配線表差し替え + 飽和は最後に1回、が torch で 動く。")
