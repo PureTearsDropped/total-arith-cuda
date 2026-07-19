@@ -44,7 +44,9 @@ Measured on an **RTX 5090**:
 ④ entry totalization + audit regressions: NaN/Inf leak none; (+MIN,LE)+(−MIN,=) → no-bound+SUNK
 ⑤ flag-algebra oracle: 600,000 flagged-input cases, true values sampled from the
    admissible sets → lies 0 (one-sided bound, sign, and no-NaN contracts)
-⑥ group_mul oracle: 20,000 flagged quaternion rows → lies 0, SUNK propagation ✓
+⑥ group_mul oracle (pattern rule): dense ± lies 0 (retention 0.5%) /
+   sparse lies 0 (89%) / positive-cyclic lies 0 (100%); audit counterexample
+   (2,SUNK)×(3,=) → exact magnitude + unknown sign
 ```
 
 ### External adversarial review (2026-07-19)
@@ -70,11 +72,15 @@ dropped `SUNK` (an unknown-sign input component yielded a confidently-signed out
 Confirmed by execution, fixed — and while writing the oracle test ⑥ for it, the test
 found a *deeper* soundness gap the reviewer hadn't named: in a multiply–accumulate,
 **mere magnitude bounds (GE/LE) on an input also invalidate the output's sign claim**
-(uncertainty shifts the cancellation balance: 6−10 vs 6−2). Current conservative rule:
-any flag on any input component drops the whole row to *no-bound + SUNK*. Exact interval
-propagation (which keeps more information) lives in the hardware implementation
-(`bfp_sed` in total-arith-hardware); this GPU version deliberately trades precision of
-the flags for simplicity, never soundness.
+(uncertainty shifts the cancellation balance: 6−10 vs 6−2). This led to a **pattern rule** (zero
+lies is absolute; keep the maximum within it), judged per output component: **P0** all
+contributing terms exact → keep claims; **P1** a single live term → cancellation is
+impossible, the scalar rule survives (with SUNK the magnitude claim is kept, only the
+sign is unknown); **P2** all live terms share one known sign → the sum is monotone
+(all-GE→GE, all-LE→LE, sign = the common sign); **P3/4** mixed signs or SUNK among ≥2
+terms → no-bound + SUNK. Measured retention on flagged rows: dense random ±: 0.5% (the
+blanket rule was near-optimal there), sparse 2-component products: 89%, all-positive
+cyclic convolution: 100% — with **0 lies** in every scenario (oracle ⑥).
 
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
@@ -97,7 +103,7 @@ Measured here (Julia 1.11.5, CPU):
 ③ CPU throughput: ~1 M sedenion products/s (reference; GPU path untested here)
 ④ entry totalization + audit regressions: all green (same cases as the Python ④)
 ⑤ flag-algebra oracle: 300,000 flagged-input cases → lies 0
-⑥ group_mul oracle: 10,000 flagged quaternion rows → lies 0, SUNK propagation ✓
+⑥ group_mul oracle (pattern rule): same three scenarios — lies 0, retention 0.5%/89%/100%
 ⑦ cross-validation vs cuda_total.py: 49 cases (adversarial mul/add/div, flagged
    additions, entry totalization, quaternion group_mul incl. SUNK/GE inputs) —
    values AND flags bit-identical between the two implementations, after all fixes
