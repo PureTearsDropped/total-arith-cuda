@@ -170,7 +170,15 @@ rates it will require — supply the future instead of reacting to the past):
 | ×3.5 (11.8 m/s, 6.9 g) | | ✗ diverges | 204 cm (still flying) |
 
 ~50× precision at racing speeds and a ~2× larger flight envelope, from a few lines of
-feedforward. Honest note: through the *noisy estimator* at gentle speeds the same FF
+feedforward.
+
+**Gusts vs. lies** (`gust_demo()`, same script): three smooth gusts up to 8.5 m/s (a real
+force) plus the six gyro spikes (a lie), in one flight. Measured: the controller *fights*
+the wind (25–29 cm max deviation, recovered by gust end) while the flags *reject* the
+spikes (6/6 named) — and crucially, **0 false positives during gusts**: a physically
+possible force never trips the saturation flags. RMS with gusts+spikes equals RMS with
+gusts alone (0.117 m) — the lies cost exactly nothing. The flag is a detector for
+physically impossible numbers, not for hard conditions. Honest note: through the *noisy estimator* at gentle speeds the same FF
 slightly *hurt* (0.059→0.083 m RMS — `w_des` inherits sensor noise), so the glitch demo
 keeps plain PD; the sweep isolates control performance on clean state. Tools belong to
 their regimes. (This demo also caught a real
