@@ -155,14 +155,49 @@ def group_mul(T, a, b):
     raw = torch.einsum('kij,...i,...j->...k', T.double(), a.val.double(), b.val.double())
     val, sflag = _sat(raw, a.val.device)
     fin = (a.flag | b.flag)
-    # フラグ伝播（外部AI監査 第2ラウンド 2026-07-19 で SUNK 落ちが 発覚 → 修正時に
-    # 自前オラクル⑥が さらに 発見: **境界(GE/LE)だけでも 符号主張は 落ちる**。
-    # 積和では 大きさの 不確かさが 項の 相殺バランスを 変え、和の 符号まで 反転しうる
-    # （例: 6−10 と 6−2）。⟹ 入力行に フラグが 一つでも あれば、行全体を
-    # 境界なし+SUNK に 落とす（大きさも 符号も 主張しない）。厳密な 区間伝播は
-    # ハードウェア版 bfp_sed が 持つ・ここは 保守的 GPU 実装。
-    anyflag = (fin > 0).any(dim=-1, keepdim=True).expand(sflag.shape)
-    f = sflag | anyflag.to(torch.uint8) * (GE | LE | SUNK)
+    if int(fin.max()) == 0:                                     # 速い道: フラグなし
+        return Tot(val, sflag)
+    # パターン則（2026-07-19 監査後の 設計: 嘘ゼロは 絶対・その範囲で 最大限 残す）。
+    # 出力成分 = 積の和。危険は「相殺」だけなので、成分ごとに 判定する:
+    #   P0 関与項が 全て 厳密         → 主張そのまま
+    #   P1 生きた項が 1 個            → 相殺不能 ⟹ スカラー積の E1 が そのまま生きる
+    #                                    （SUNK でも 大きさ主張は 保持・符号のみ 不明）
+    #   P2 生きた項が 全て 同符号(既知) → 和は 単調 ⟹ 全GE→GE / 全LE→LE・符号=共通
+    #   P3/4 符号混在 or SUNK 多項     → 境界なし+SUNK（6−10 vs 6−2: 符号も 大きさも 落ちる）
+    # 実測(パターン地図): 密±乱数は ほぼ P3/4（保守則が 最適）・疎積は 99% P1/P0・
+    # 全正の畳み込みは 99% P2 — 疎・正値で 情報が 生き返る。
+    Mk = T.shape[0]
+    outf = torch.zeros_like(sflag)
+    outsunk = torch.zeros(sflag.shape, dtype=torch.bool, device=val.device)
+    NBv = torch.full_like(sflag[..., 0], GE | LE)
+    for k in range(Mk):
+        nz = (T[k] != 0).nonzero()
+        ii, jj = nz[:, 0], nz[:, 1]
+        ss = torch.sign(T[k, ii, jj])
+        ai, bj = a.val[..., ii], b.val[..., jj]
+        fa, fb = a.flag[..., ii], b.flag[..., jj]
+        live = (ai != 0) & (bj != 0)
+        tf = torch.where(live, _mul_flags(fa, fb), torch.zeros_like(fa))   # 項ごとの E1
+        touched = ((tf | (torch.where(live, fa | fb, torch.zeros_like(fa)))) > 0).any(dim=-1)
+        sunk_any = ((((fa | fb) & SUNK) > 0) & live).any(dim=-1)
+        n_live = live.sum(dim=-1)
+        tsgn = ss * torch.sign(ai) * torch.sign(bj)
+        smax = torch.where(live, tsgn, torch.full_like(tsgn, -2.0)).max(dim=-1).values
+        smin = torch.where(live, tsgn, torch.full_like(tsgn, 2.0)).min(dim=-1).values
+        same_sign = (smax == smin)
+        ge_ok = ((tf & LE) == 0).all(dim=-1)                    # LE ビットの live 項が 無い
+        le_ok = ((tf & GE) == 0).all(dim=-1)
+        any_ge = ((tf & GE) > 0).any(dim=-1)
+        any_le = ((tf & LE) > 0).any(dim=-1)
+        f2 = (ge_ok & any_ge).to(torch.uint8) * GE | (le_ok & any_le).to(torch.uint8) * LE
+        f2 = f2 | (~ge_ok & ~le_ok).to(torch.uint8) * (GE | LE)
+        keep = (~sunk_any & (same_sign | (n_live <= 1))) | (sunk_any & (n_live == 1))
+        p0 = ~touched
+        fk = torch.where(p0, torch.zeros_like(f2), torch.where(keep, f2, NBv))
+        sk = ~p0 & (~keep | (sunk_any & (n_live == 1)))
+        outf[..., k] = fk
+        outsunk[..., k] = sk
+    f = sflag | outf | outsunk.to(torch.uint8) * SUNK
     return Tot(val, f)
 
 
@@ -309,29 +344,53 @@ def self_test():
 
     print()
     print("=" * 76)
-    print("⑥ group_mul の オラクル検査（外部AI監査 第2ラウンド: SUNK 伝播の 指摘に 応答）")
+    print("⑥ group_mul の オラクル検査（第2ラウンド SUNK 指摘 + パターン則の 健全性/保持率）")
     print("=" * 76)
-    M6 = 4; T6 = wiring_tensor("cd", M6, dev)
-    KB = 20_000
     def rand_flagged_mat(KB, M):
         tt, tv = rand_flagged(KB * M)
         m = Tot(tt.val.reshape(KB, M)); m.flag = tt.flag.reshape(KB, M)
         return m, tv.reshape(KB, M)
-    A6, ta6 = rand_flagged_mat(KB, M6); B6, tb6 = rand_flagged_mat(KB, M6)
-    r6 = group_mul(T6, A6, B6)
-    t6 = torch.einsum('kij,bi,bj->bk', T6.double(), ta6, tb6)   # 真の配線積
-    ge = (r6.flag & GE) > 0; le = (r6.flag & LE) > 0; sk = (r6.flag & SUNK) > 0
-    vo = r6.val.double(); slack = 2.0 ** -20
-    lies6 = int((ge & ~le & (t6.abs() < vo.abs() * (1 - slack))).sum())
-    lies6 += int((le & ~ge & (t6.abs() > vo.abs() * (1 + slack))).sum())
-    lies6 += int(((~sk) & (vo != 0) & (t6 != 0)
-                  & (torch.sign(t6) != torch.sign(vo))).sum())
-    lies6 += int(torch.isnan(r6.val).sum() + torch.isinf(r6.val).sum())
-    # SUNK 伝播の 明示回帰: 入力行に SUNK が あれば 出力行 全成分に SUNK
-    insunk = (((A6.flag | B6.flag) & SUNK) > 0).any(dim=-1)
-    sunk_ok = bool(((r6.flag[insunk] & SUNK) > 0).all())
-    print(f"  {KB:,} 行 × {M6}成分（四元数・フラグ付き）: 嘘 **{lies6}**・SUNK伝播 {'✓' if sunk_ok else '×'}")
-    assert lies6 == 0 and sunk_ok
+    def check6(label, kind, M, KB, mode):
+        T = wiring_tensor(kind, M, dev)
+        A, ta = rand_flagged_mat(KB, M); B, tb = rand_flagged_mat(KB, M)
+        if mode == "sparse":                                    # 2成分だけ 非ゼロ
+            keep = torch.zeros(KB, M, dtype=torch.bool, device=dev)
+            keep.scatter_(1, torch.randint(0, M, (KB, 2), device=dev), True)
+            for X, tx in ((A, ta), (B, tb)):
+                X.val = torch.where(keep, X.val, torch.zeros_like(X.val))
+                X.flag = torch.where(keep, X.flag, torch.zeros_like(X.flag))
+            ta = torch.where(keep, ta, torch.zeros_like(ta))
+            tb = torch.where(keep, tb, torch.zeros_like(tb))
+        elif mode == "positive":                                # 全正・符号既知
+            for X in (A, B):
+                X.val = X.val.abs(); X.flag = X.flag & ~SUNK
+            ta, tb = ta.abs(), tb.abs()
+        r = group_mul(T, A, B)
+        t = torch.einsum('kij,bi,bj->bk', T.double(), ta, tb)
+        ge = (r.flag & GE) > 0; le = (r.flag & LE) > 0; sk = (r.flag & SUNK) > 0
+        vo = r.val.double(); slack = 2.0 ** -20
+        lies = int((ge & ~le & (t.abs() < vo.abs() * (1 - slack))).sum())
+        lies += int((le & ~ge & (t.abs() > vo.abs() * (1 + slack))).sum())
+        lies += int(((~sk) & (vo != 0) & (t != 0)
+                     & (torch.sign(t) != torch.sign(vo))).sum())
+        lies += int(torch.isnan(r.val).sum() + torch.isinf(r.val).sum())
+        # 保持率: フラグを含む 入力行のうち、何かを 主張できた 出力成分の 割合
+        frow = (((A.flag | B.flag)) > 0).any(dim=-1, keepdim=True).expand(r.flag.shape)
+        claims = ((ge ^ le) | ~sk) & frow
+        ret = float(claims.sum()) / max(int(frow.sum()), 1)
+        print(f"  {label:<22} {KB:,}行: 嘘 **{lies}**・主張保持率 {ret:5.1%}")
+        return lies
+    bad6 = check6("四元数・密±乱数", "cd", 4, 20_000, "dense")
+    bad6 += check6("セデニオン・疎(2成分)", "cd", 16, 5_000, "sparse")
+    bad6 += check6("巡回Z/8・全正(畳込)", "cyclic", 8, 10_000, "positive")
+    # 監査の 原反例（M=1・単項 SUNK）: 大きさは 保持・符号だけ 不明、が 正解
+    T1 = wiring_tensor("cd", 1, dev)
+    xs = Tot(torch.tensor([[2.0]], device=dev)); xs.flag = torch.tensor([[SUNK]], dtype=torch.uint8, device=dev)
+    r1 = group_mul(T1, xs, Tot(torch.tensor([[3.0]], device=dev)))
+    reg6 = int(r1.flag.item()) == SUNK and float(r1.val.item()) == 6.0
+    print(f"  原反例 (2,SUNK)×(3,=): val={r1.val.item():g} flag={int(r1.flag.item())} "
+          f"= 大きさ厳密+符号不明 {'✓' if reg6 else '×'}")
+    assert bad6 == 0 and reg6
 
     print()
     print("GPU 版: 全域算術（無NaN・フラグ）+ 配線表差し替え + 飽和は最後に1回、が torch で 動く。")

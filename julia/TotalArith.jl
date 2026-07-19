@@ -144,14 +144,46 @@ function group_mul(T::AbstractArray{Float32,3}, a::Tot, b::Tot)
     end
     val, sflag = _sat(raw)
     fin  = a.flag .| b.flag
-    # Flag propagation (audit round 2 found SUNK was dropped; while fixing it, our own
-    # oracle ⑥ found more: **mere bounds (GE/LE) also invalidate the sign claim** — in a
-    # MAC, magnitude uncertainty shifts the cancellation balance and can flip the sign of
-    # the sum (e.g. 6−10 vs 6−2). ⟹ any flag on any input component drops the whole row
-    # to no-bound + SUNK (no magnitude, no sign claim). Exact interval propagation lives
-    # in the hardware bfp_sed implementation; this is the conservative GPU one.
-    anyflag = any(fin .> 0, dims=2)
-    f = sflag .| (UInt8.(anyflag) .* (GE | LE | SUNK))
+    if maximum(fin) == 0x00                          # fast path: no flags
+        return Tot(val, sflag)
+    end
+    # Pattern rule (post-audit design: zero lies is absolute; keep the maximum within it).
+    # An output component is a sum of products; the only danger is cancellation, so judge
+    # per component: P0 all contributing terms exact → keep claims; P1 single live term →
+    # cancellation impossible, scalar E1 survives (SUNK keeps the magnitude claim, only the
+    # sign is unknown); P2 all live terms same known sign → the sum is monotone (all GE→GE,
+    # all LE→LE, sign = the common sign); P3/4 mixed signs or SUNK among ≥2 terms →
+    # no-bound + SUNK (6−10 vs 6−2: both magnitude and sign are lost).
+    M = size(T, 1)
+    outf = fill!(similar(sflag), 0x00)
+    outsunk = fill!(similar(sflag, Bool), false)
+    for k in 1:M
+        nzs = findall(!=(0f0), @view T[k, :, :])
+        ii = [c[1] for c in nzs]; jj = [c[2] for c in nzs]
+        ss = reshape(Float64.(sign.(T[k, :, :][nzs])), 1, :)
+        ai = a.val[:, ii]; bj = b.val[:, jj]
+        fa = a.flag[:, ii]; fb = b.flag[:, jj]
+        live = (ai .!= 0) .& (bj .!= 0)
+        tf = ifelse.(live, _mul_flags(fa, fb), 0x00)            # per-term E1
+        touched = vec(any((tf .| ifelse.(live, fa .| fb, 0x00)) .> 0, dims=2))
+        sunk_any = vec(any((((fa .| fb) .& SUNK) .> 0) .& live, dims=2))
+        n_live = vec(sum(live, dims=2))
+        tsgn = ss .* sign.(Float64.(ai)) .* sign.(Float64.(bj))
+        smax = vec(maximum(ifelse.(live, tsgn, -2.0), dims=2))
+        smin = vec(minimum(ifelse.(live, tsgn, 2.0), dims=2))
+        same_sign = smax .== smin
+        ge_ok = vec(all((tf .& LE) .== 0, dims=2))
+        le_ok = vec(all((tf .& GE) .== 0, dims=2))
+        any_ge = vec(any((tf .& GE) .> 0, dims=2))
+        any_le = vec(any((tf .& LE) .> 0, dims=2))
+        f2 = (UInt8.(ge_ok .& any_ge) .* GE) .| (UInt8.(le_ok .& any_le) .* LE) .|
+             (UInt8.(.!ge_ok .& .!le_ok) .* (GE | LE))
+        keep = (.!sunk_any .& (same_sign .| (n_live .<= 1))) .| (sunk_any .& (n_live .== 1))
+        p0 = .!touched
+        outf[:, k] = ifelse.(p0, 0x00, ifelse.(keep, f2, GE | LE))
+        outsunk[:, k] = .!p0 .& (.!keep .| (sunk_any .& (n_live .== 1)))
+    end
+    f = sflag .| outf .| (UInt8.(outsunk) .* SUNK)
     return Tot(val, f)
 end
 
@@ -289,31 +321,51 @@ function self_test()
     @assert lies5 == 0
 
     println("="^72)
-    println("⑥ group_mul oracle (external AI audit round 2: SUNK propagation)")
+    println("⑥ group_mul oracle (audit round 2 + pattern-rule soundness/retention)")
     println("="^72)
-    M6 = 4; T6 = wiring_tensor(:cd, M6)
-    KB = 10_000
-    Af, taf = rand_flagged(KB * M6); Bf, tbf = rand_flagged(KB * M6)
-    A6 = Tot(reshape(Af.val, KB, M6), reshape(Af.flag, KB, M6))
-    B6 = Tot(reshape(Bf.val, KB, M6), reshape(Bf.flag, KB, M6))
-    ta6 = reshape(taf, KB, M6); tb6 = reshape(tbf, KB, M6)
-    r6 = group_mul(T6, A6, B6)
-    t6 = similar(ta6)
-    for k in 1:M6
-        Tk = Float64.(@view T6[k, :, :])
-        t6[:, k] = sum((ta6 * Tk) .* tb6, dims=2)
+    function check6(label, kind, M, KB, mode)
+        T = wiring_tensor(kind, M)
+        Af, taf = rand_flagged(KB * M); Bf, tbf = rand_flagged(KB * M)
+        av = reshape(Af.val, KB, M); afl = reshape(Af.flag, KB, M); ta = reshape(taf, KB, M)
+        bv = reshape(Bf.val, KB, M); bfl = reshape(Bf.flag, KB, M); tb = reshape(tbf, KB, M)
+        if mode == :sparse
+            keep = falses(KB, M)
+            for r in 1:KB, _ in 1:2; keep[r, rand(rng, 1:M)] = true; end
+            av = ifelse.(keep, av, 0f0); afl = ifelse.(keep, afl, 0x00); ta = ifelse.(keep, ta, 0.0)
+            bv = ifelse.(keep, bv, 0f0); bfl = ifelse.(keep, bfl, 0x00); tb = ifelse.(keep, tb, 0.0)
+        elseif mode == :positive
+            av = abs.(av); bv = abs.(bv); ta = abs.(ta); tb = abs.(tb)
+            afl = afl .& ~SUNK; bfl = bfl .& ~SUNK
+        end
+        A = Tot(av, afl); B = Tot(bv, bfl)
+        r = group_mul(T, A, B)
+        t = similar(ta)
+        for k in 1:M
+            Tk = Float64.(@view T[k, :, :])
+            t[:, k] = sum((ta * Tk) .* tb, dims=2)
+        end
+        ge = (r.flag .& GE) .> 0; le = (r.flag .& LE) .> 0; sk = (r.flag .& SUNK) .> 0
+        vo = Float64.(r.val); slack = 2.0^-20
+        lies = count(ge .& .!le .& (abs.(t) .< abs.(vo) .* (1 - slack)))
+        lies += count(le .& .!ge .& (abs.(t) .> abs.(vo) .* (1 + slack)))
+        lies += count(.!sk .& (vo .!= 0) .& (t .!= 0) .& (sign.(t) .!= sign.(vo)))
+        lies += count(x -> isnan(x) || isinf(x), r.val)
+        frow = repeat(any((afl .| bfl) .> 0, dims=2), 1, M)
+        claims = ((ge .⊻ le) .| .!sk) .& frow
+        ret = count(claims) / max(count(frow), 1)
+        println("  $(rpad(label, 24)) $(KB) rows: lies $(lies), claims retained $(round(100ret, digits=1))%")
+        return lies
     end
-    ge = (r6.flag .& GE) .> 0; le = (r6.flag .& LE) .> 0; sk = (r6.flag .& SUNK) .> 0
-    vo = Float64.(r6.val); slack = 2.0^-20
-    lies6 = count(ge .& .!le .& (abs.(t6) .< abs.(vo) .* (1 - slack)))
-    lies6 += count(le .& .!ge .& (abs.(t6) .> abs.(vo) .* (1 + slack)))
-    lies6 += count(.!sk .& (vo .!= 0) .& (t6 .!= 0) .& (sign.(t6) .!= sign.(vo)))
-    lies6 += count(x -> isnan(x) || isinf(x), r6.val)
-    insunk = vec(any(((A6.flag .| B6.flag) .& SUNK) .> 0, dims=2))
-    sunk_ok = all((r6.flag[insunk, :] .& SUNK) .> 0)
-    println("  $(KB) rows × $(M6) components (quaternion, flagged): lies $(lies6), " *
-            "SUNK propagation $(sunk_ok ? "✓" : "✗")")
-    @assert lies6 == 0 && sunk_ok
+    bad6 = check6("quaternion dense ±", :cd, 4, 10_000, :dense)
+    bad6 += check6("sedenion sparse(2)", :cd, 16, 2_000, :sparse)
+    bad6 += check6("cyclic ℤ/8 positive", :cyclic, 8, 5_000, :positive)
+    T1 = wiring_tensor(:cd, 1)
+    r1 = group_mul(T1, Tot(reshape(Float32[2.0], 1, 1), reshape(UInt8[SUNK], 1, 1)),
+                       Tot(reshape(Float32[3.0], 1, 1)))
+    reg6 = r1.flag[1] == SUNK && r1.val[1] == 6f0
+    println("  audit counterexample (2,SUNK)×(3,=): val=$(r1.val[1]) flag=$(Int(r1.flag[1])) " *
+            "= exact magnitude + unknown sign $(reg6 ? "✓" : "✗")")
+    @assert bad6 == 0 && reg6
 
     println()
     println("TotalArith.jl: totality (no NaN, honest flags) + wiring swap + " *
