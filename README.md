@@ -42,10 +42,11 @@ Measured on an **RTX 5090**:
      cyclic ℤ/8 M= 8  violations 0/200
 ③ throughput: 68.0 M sedenion products/s (batch 1e6, flags + no-NaN included)
 ④ entry totalization + audit regressions: NaN/Inf leak none; (+MIN,LE)+(−MIN,=) → no-bound+SUNK
-⑤ flag-algebra oracle: 600,000 flagged-input cases (incl. flagged zeros, lone SUNK,
-   10^6 multipliers) → lies 0 (one-sided, exact-magnitude, sign, no-NaN contracts)
+⑤ flag-algebra oracle: 600,000 flagged-input cases × two witnesses (incl. flagged
+   zeros, lone SUNK, 10^6 multipliers) → lies 0 (six contracts: one-sided bound,
+   exact-magnitude, sign, zero-display, witness-agreement, no-NaN)
 ⑥ group_mul oracle (pattern rule): dense ± / sparse / positive-cyclic → lies 0 each,
-   retention 0.5% / 89% / 40%; four audit counterexamples kept as regressions
+   retention 0.5% / 89% / 39%; eight audit counterexamples kept as regressions
 ```
 
 ### External adversarial review (2026-07-19)
@@ -100,6 +101,17 @@ exact-magnitude, sign, no-NaN).
 is exactly what a **4-valued digit** `{0, 1, −1, unknown}` representation eliminates by
 construction (the hardware repo's `quadsign.py` / `sed/trit_status.py` explored this;
 there, unknown is a first-class value and its algebra is the digit product itself).
+
+**Round 4** (same day): the reviewer found the dangerous-zero semantics existed **only in
+`group_mul`** — the same encoding `(0, GE)` meant "sign unknown" there but "sign known" in
+scalar `tot_mul`/`tot_div` (two semantics for one representation): `(0,GE)×(3,=)` and
+`(1,=)/(0,GE)` lacked `SUNK`. Fixed: the dangerous-zero rule now applies to scalars too.
+The oracle gained the two contracts the reviewer showed it was blind to: *no `SUNK` ⟹ a
+displayed zero is truly zero*, and *no `SUNK` ⟹ two independently sampled witnesses never
+disagree in sign* (one witness cannot detect sign-indeterminacy). Alongside, the zero
+doctrine was made explicit and implemented: **a true zero is signless** (direction lives
+in `±MIN`, never in `0`) **and absorbs**: `(0, exact) × (x, any flags) = (0, no flags)` —
+the other factor's uncertainty vanishes, per `x×0=0` exact.
 
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
