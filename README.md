@@ -139,6 +139,28 @@ Same two-layer structure as the gravity-law experiment in varpro-powersum-nn: to
 keeps the system alive; the flags name every poisoned sample, and rejecting them restores
 clean-baseline accuracy exactly.
 
+### Demo 2 — 6-DoF flight on one wiring kernel (`demo_flight.py`)
+
+Full pose (attitude **and** position) as a **dual quaternion** — Cayley–Dickson with a
+degenerate twist (ε² = 0) — composed by the *same* `group_mul` kernel with an 8-wide
+table, plus **motor mixing as a wiring**: the 4×4 mixer matrix is packed as a 16-component
+"number" in one operand and multiplied through a universal matrix-vector table. A
+pretzel trajectory (3-D Lissajous), 6 gyro spikes, cascade position/attitude control:
+
+| arm | crashes | tracking RMS | spikes flagged | false pos |
+|---|---|---|---|---|
+| IEEE, no glitches (baseline) | 0/3 | 0.059 m | — | — |
+| IEEE float32 | 3/3 | — | — | — |
+| total arithmetic, no rejection | 3/3 | — | (dies at 1st spike) | — |
+| **TOT + flag rejection** | **0/3** | **0.059 m** | 6/6 | 0 |
+
+Sharper lesson than demo 1: in 6-DoF, totalization alone is *not* enough — the arithmetic
+survives but the corrupted pose still diverges the controller. **The flags are the
+difference between surviving and completing the mission.** (This demo also caught a real
+library bug — `group_mul` crashed on wiring tables with empty output rows, a shape that
+hypercomplex algebras never produce but matrix-vector wirings do. Fixed in both
+implementations.)
+
 ### Julia port — `julia/TotalArith.jl`
 
 The same semantics in **generic Julia**: written against `AbstractArray` with only
