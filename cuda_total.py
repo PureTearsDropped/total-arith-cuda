@@ -197,6 +197,8 @@ def group_mul(T, a, b):
     NBv = torch.full_like(sflag[..., 0], GE | LE)
     for k in range(Mk):
         nz = (T[k] != 0).nonzero()
+        if nz.numel() == 0:
+            continue                                            # 空の出力行 = 常に 厳密な 0
         ii, jj = nz[:, 0], nz[:, 1]
         ss = torch.sign(T[k, ii, jj])
         ai, bj = a.val[..., ii], b.val[..., jj]

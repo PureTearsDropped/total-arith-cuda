@@ -177,6 +177,7 @@ function group_mul(T::AbstractArray{Float32,3}, a::Tot, b::Tot)
     outsunk = fill!(similar(sflag, Bool), false)
     for k in 1:M
         nzs = findall(!=(0f0), @view T[k, :, :])
+        isempty(nzs) && continue                     # empty output row = always exactly 0
         ii = [c[1] for c in nzs]; jj = [c[2] for c in nzs]
         ss = reshape(Float64.(sign.(T[k, :, :][nzs])), 1, :)
         ai = a.val[:, ii]; bj = b.val[:, jj]
