@@ -42,11 +42,10 @@ Measured on an **RTX 5090**:
      cyclic ℤ/8 M= 8  violations 0/200
 ③ throughput: 68.0 M sedenion products/s (batch 1e6, flags + no-NaN included)
 ④ entry totalization + audit regressions: NaN/Inf leak none; (+MIN,LE)+(−MIN,=) → no-bound+SUNK
-⑤ flag-algebra oracle: 600,000 flagged-input cases, true values sampled from the
-   admissible sets → lies 0 (one-sided bound, sign, and no-NaN contracts)
-⑥ group_mul oracle (pattern rule): dense ± lies 0 (retention 0.5%) /
-   sparse lies 0 (89%) / positive-cyclic lies 0 (100%); audit counterexample
-   (2,SUNK)×(3,=) → exact magnitude + unknown sign
+⑤ flag-algebra oracle: 600,000 flagged-input cases (incl. flagged zeros, lone SUNK,
+   10^6 multipliers) → lies 0 (one-sided, exact-magnitude, sign, no-NaN contracts)
+⑥ group_mul oracle (pattern rule): dense ± / sparse / positive-cyclic → lies 0 each,
+   retention 0.5% / 89% / 40%; four audit counterexamples kept as regressions
 ```
 
 ### External adversarial review (2026-07-19)
@@ -82,6 +81,26 @@ terms → no-bound + SUNK. Measured retention on flagged rows: dense random ±: 
 blanket rule was near-optimal there), sparse 2-component products: 89%, all-positive
 cyclic convolution: 100% — with **0 lies** in every scenario (oracle ⑥).
 
+**Round 3** (same day): the reviewer found the pattern rule's premise itself was broken —
+`live = (val ≠ 0)` conflated *displayed* zero with *true* zero, so a term like
+`(0, no-bound+SUNK)` (true value arbitrary — exactly the shape `_sat(NaN)` produces) was
+silently dropped as a dead term, and `group_mul` then claimed exact results. Confirmed by
+execution, fixed: a displayed zero with no `GE` bit is *definitely zero* (droppable); a
+displayed zero **with** a `GE` bit is a *dangerous zero* — every component it touches
+falls to no-bound + SUNK. While strengthening the oracle per the reviewer's blind-spot
+list (flagged zeros, lone `SUNK`, unbounded multipliers), **our own oracle then found a
+fourth bug the reviewer hadn't**: SUNK-only *addition* claimed exact magnitude, but
+`(2,SUNK)+(3,SUNK)` has true value ±2±3, i.e. |true| ∈ {1,5} — cancellation breaks the
+magnitude too. The addition rule now drops to no-bound+SUNK whenever cancellation is
+possible and *any* flag (not just a bound) is present. All four counterexamples are
+permanent regressions; the oracle now checks four contracts (one-sided bound,
+exact-magnitude, sign, no-NaN).
+
+*Design note:* this bug family — "unknown" encoded as awkward corners of `(val, flag)` —
+is exactly what a **4-valued digit** `{0, 1, −1, unknown}` representation eliminates by
+construction (the hardware repo's `quadsign.py` / `sed/trit_status.py` explored this;
+there, unknown is a first-class value and its algebra is the digit product itself).
+
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
 ### Julia port — `julia/TotalArith.jl`
@@ -102,8 +121,8 @@ Measured here (Julia 1.11.5, CPU):
 ② wiring swap: complex / quaternion / sedenion / cyclic ℤ/8 — violations 0/200 each
 ③ CPU throughput: ~1 M sedenion products/s (reference; GPU path untested here)
 ④ entry totalization + audit regressions: all green (same cases as the Python ④)
-⑤ flag-algebra oracle: 300,000 flagged-input cases → lies 0
-⑥ group_mul oracle (pattern rule): same three scenarios — lies 0, retention 0.5%/89%/100%
+⑤ flag-algebra oracle: 300,000 flagged-input cases → lies 0 (four contracts)
+⑥ group_mul oracle (pattern rule): same three scenarios — lies 0, retention 0.5%/88%/40%
 ⑦ cross-validation vs cuda_total.py: 49 cases (adversarial mul/add/div, flagged
    additions, entry totalization, quaternion group_mul incl. SUNK/GE inputs) —
    values AND flags bit-identical between the two implementations, after all fixes
