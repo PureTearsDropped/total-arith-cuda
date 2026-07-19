@@ -40,6 +40,30 @@ Measured on an **RTX 5090**:
 
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
+### Julia port — `julia/TotalArith.jl`
+
+The same semantics in **generic Julia**: written against `AbstractArray` with only
+broadcasts + matmul, so the same functions run on `Array` (CPU) and are **CuArray-ready**
+(CUDA.jl) without modification — Julia's multiple dispatch gives the CPU/GPU "backend swap"
+for free.
+
+```bash
+julia julia/TotalArith.jl     # self-test, no packages needed (stdlib only)
+```
+
+Measured here (Julia 1.11.5, CPU):
+
+```
+① totality: 1,000,000 × mul/add/div → NaN/Inf 0, flag lies 0
+② wiring swap: complex / quaternion / sedenion / cyclic ℤ/8 — violations 0/200 each
+③ CPU throughput: 1.37 M sedenion products/s (reference; GPU path untested here)
+④ cross-validation vs cuda_total.py: 34 adversarial cases (mul/add/div + quaternion
+   group_mul) — values AND flags bit-identical between the two implementations
+```
+
+The CuArray path is written but not exercised in this environment; if you run it on GPU,
+an issue reporting the result (either way) is welcome.
+
 ---
 
 ## これは何か（JP）
