@@ -44,6 +44,7 @@ Measured on an **RTX 5090**:
 ④ entry totalization + audit regressions: NaN/Inf leak none; (+MIN,LE)+(−MIN,=) → no-bound+SUNK
 ⑤ flag-algebra oracle: 600,000 flagged-input cases, true values sampled from the
    admissible sets → lies 0 (one-sided bound, sign, and no-NaN contracts)
+⑥ group_mul oracle: 20,000 flagged quaternion rows → lies 0, SUNK propagation ✓
 ```
 
 ### External adversarial review (2026-07-19)
@@ -63,6 +64,17 @@ An independent AI (ChatGPT) was asked to *refute* this code. Outcome, in the ope
   test ⑤ (admissible-true-value sampling) now covers the flag algebra directly.
 - **Independently confirmed** — the Cayley–Dickson sign convention was hand-checked by the
   reviewer against the standard quaternion table (i·j=k, j·k=i, k·i=j): consistent.
+
+**Round 2** (same day): the reviewer re-read the fixed version and found `group_mul`
+dropped `SUNK` (an unknown-sign input component yielded a confidently-signed output).
+Confirmed by execution, fixed — and while writing the oracle test ⑥ for it, the test
+found a *deeper* soundness gap the reviewer hadn't named: in a multiply–accumulate,
+**mere magnitude bounds (GE/LE) on an input also invalidate the output's sign claim**
+(uncertainty shifts the cancellation balance: 6−10 vs 6−2). Current conservative rule:
+any flag on any input component drops the whole row to *no-bound + SUNK*. Exact interval
+propagation (which keeps more information) lives in the hardware implementation
+(`bfp_sed` in total-arith-hardware); this GPU version deliberately trades precision of
+the flags for simplicity, never soundness.
 
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
@@ -85,9 +97,10 @@ Measured here (Julia 1.11.5, CPU):
 ③ CPU throughput: ~1 M sedenion products/s (reference; GPU path untested here)
 ④ entry totalization + audit regressions: all green (same cases as the Python ④)
 ⑤ flag-algebra oracle: 300,000 flagged-input cases → lies 0
-⑥ cross-validation vs cuda_total.py: 41 cases (adversarial mul/add/div, flagged
-   additions, entry totalization, quaternion group_mul) — values AND flags
-   bit-identical between the two implementations, after the audit fixes
+⑥ group_mul oracle: 10,000 flagged quaternion rows → lies 0, SUNK propagation ✓
+⑦ cross-validation vs cuda_total.py: 49 cases (adversarial mul/add/div, flagged
+   additions, entry totalization, quaternion group_mul incl. SUNK/GE inputs) —
+   values AND flags bit-identical between the two implementations, after all fixes
 ```
 
 Shape parity note: Python's `group_mul` accepts arbitrary leading batch dims (einsum `...`);
