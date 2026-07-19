@@ -75,11 +75,13 @@ function tot_add(a::Tot, b::Tot)
     raw = Float64.(a.val) .+ Float64.(b.val)
     val, sflag = _sat(raw)
     fin  = a.flag .| b.flag
-    anyb = (fin .& (GE | LE)) .> 0
     sign_known = (fin .& SUNK) .== 0x00
     same_sign  = (sign.(a.val) .* sign.(b.val)) .> 0     # strict: zero is not same-sign
     cancel = .!(sign_known .& same_sign)
-    f = ifelse.(anyb .& cancel, GE | LE | SUNK, fin)
+    # Cancellation-possible × ANY flag → no-bound + SUNK. Not just bounds: SUNK alone also
+    # breaks the exact-magnitude claim — (2,SUNK)+(3,SUNK) has true value ±2±3, |true| ∈
+    # {1,5} (found by our strengthened oracle after audit round 3, 2026-07-19).
+    f = ifelse.((fin .> 0) .& cancel, GE | LE | SUNK, fin)
     return Tot(val, sflag .| f)
 end
 
@@ -163,7 +165,17 @@ function group_mul(T::AbstractArray{Float32,3}, a::Tot, b::Tot)
         ss = reshape(Float64.(sign.(T[k, :, :][nzs])), 1, :)
         ai = a.val[:, ii]; bj = b.val[:, jj]
         fa = a.flag[:, ii]; fb = b.flag[:, jj]
-        live = (ai .!= 0) .& (bj .!= 0)
+        # "displayed zero" ≠ "truly zero" (audit round 3, 2026-07-19). Definitely-zero =
+        # display 0 with no GE bit (|true| ≤ 0 ⟹ true = 0) → safe to drop as a dead term.
+        # Dangerous zero = display 0 WITH a GE bit (true value arbitrary / sign unknown —
+        # _sat(NaN) = (0,7) has this shape) → must NOT be dropped: any component it touches
+        # falls to no-bound + SUNK.
+        defz_a = (ai .== 0) .& ((fa .& GE) .== 0)
+        defz_b = (bj .== 0) .& ((fb .& GE) .== 0)
+        dead = defz_a .| defz_b
+        danger_t = .!dead .& (((ai .== 0) .& ((fa .& GE) .> 0)) .| ((bj .== 0) .& ((fb .& GE) .> 0)))
+        danger = vec(any(danger_t, dims=2))
+        live = .!dead .& .!danger_t
         tf = ifelse.(live, _mul_flags(fa, fb), 0x00)            # per-term E1
         touched = vec(any((tf .| ifelse.(live, fa .| fb, 0x00)) .> 0, dims=2))
         sunk_any = vec(any((((fa .| fb) .& SUNK) .> 0) .& live, dims=2))
@@ -180,8 +192,10 @@ function group_mul(T::AbstractArray{Float32,3}, a::Tot, b::Tot)
              (UInt8.(.!ge_ok .& .!le_ok) .* (GE | LE))
         keep = (.!sunk_any .& (same_sign .| (n_live .<= 1))) .| (sunk_any .& (n_live .== 1))
         p0 = .!touched
-        outf[:, k] = ifelse.(p0, 0x00, ifelse.(keep, f2, GE | LE))
-        outsunk[:, k] = .!p0 .& (.!keep .| (sunk_any .& (n_live .== 1)))
+        fk = ifelse.(p0, 0x00, ifelse.(keep, f2, GE | LE))
+        sk = .!p0 .& (.!keep .| (sunk_any .& (n_live .== 1)))
+        outf[:, k] = ifelse.(danger, GE | LE, fk)               # dangerous-zero override
+        outsunk[:, k] = sk .| danger
     end
     f = sflag .| outf .| (UInt8.(outsunk) .* SUNK)
     return Tot(val, f)
@@ -289,19 +303,27 @@ function self_test()
     println("="^72)
     K = 100_000
     function rand_flagged(K)
-        mag = 10.0 .^ (rand(rng, K) .* 40 .- 20)
+        # Audit round-3 blind spots fixed: flagged display-zeros (12%), lone SUNK,
+        # GE|LE|SUNK, multipliers up to 10^6, magnitudes down near ±MIN.
+        mag = 10.0 .^ (rand(rng, K) .* 55 .- 35)
         sgn = rand(rng, (-1.0, 1.0), K)
         val = Float32.(mag .* sgn)
-        fl  = rand(rng, UInt8[0x00, GE, LE, GE|SUNK, LE|SUNK, GE|LE], K)
+        zero = rand(rng, K) .< 0.12
+        val = ifelse.(zero, 0f0, val)
+        fl  = rand(rng, UInt8[0x00, GE, LE, SUNK, GE|SUNK, LE|SUNK, GE|LE, GE|LE|SUNK], K)
         u   = rand(rng, K)
+        big = 10.0 .^ (rand(rng, K) .* 6)
         ge_ = (fl .& GE) .> 0; le_ = (fl .& LE) .> 0
         m = ones(K)
-        m = ifelse.(ge_ .& .!le_, 1 .+ 7 .* u, m)        # GE: |true| ∈ |val|·[1,8]
+        m = ifelse.(ge_ .& .!le_, 1 .+ big .* u, m)       # GE: |true| ≥ |val|, unbounded above
         m = ifelse.(le_ .& .!ge_, u, m)                   # LE: |true| ∈ |val|·[0,1]
-        m = ifelse.(ge_ .& le_, 8 .* u, m)                # no-bound: anything
-        ts = ifelse.((fl .& SUNK) .> 0, rand(rng, (-1.0, 1.0), K),
-                     sign.(Float64.(val)))                # SUNK: sign is random too
-        tv = abs.(Float64.(val)) .* m .* ts
+        m = ifelse.(ge_ .& le_, big .* u, m)              # no-bound: anything
+        freemag = 10.0 .^ (rand(rng, K) .* 58 .- 38)
+        magt = ifelse.(zero, ifelse.(ge_, freemag, 0.0),  # display 0 + GE bit ⟹ true is free
+                       abs.(Float64.(val)) .* m)
+        sgn_unknown = ((fl .& SUNK) .> 0) .| (zero .& ge_)
+        ts = ifelse.(sgn_unknown, rand(rng, (-1.0, 1.0), K), sign.(Float64.(val)))
+        tv = magt .* ts
         return Tot(val, fl), tv
     end
     A2, ta = rand_flagged(K); B2, tb = rand_flagged(K)
@@ -314,10 +336,12 @@ function self_test()
         vo = Float64.(r.val); slack = 2.0^-20
         lies5 += count(ge .& .!le .& (abs.(t) .< abs.(vo) .* (1 - slack)))
         lies5 += count(le .& .!ge .& (abs.(t) .> abs.(vo) .* (1 + slack)))
+        lies5 += count(.!ge .& .!le .&                       # no GE/LE = exact-magnitude claim
+                       (abs.(abs.(t) .- abs.(vo)) .> abs.(vo) .* slack))
         lies5 += count(.!sk .& (vo .!= 0) .& (t .!= 0) .& (sign.(t) .!= sign.(vo)))
         lies5 += count(x -> isnan(x) || isinf(x), r.val)
     end
-    println("  $(3K) flagged cases (true values sampled from admissible sets): lies $(lies5)")
+    println("  $(3K) flagged cases: lies $(lies5) (one-sided, exact-magnitude, sign, no-NaN)")
     @assert lies5 == 0
 
     println("="^72)
@@ -328,11 +352,13 @@ function self_test()
         Af, taf = rand_flagged(KB * M); Bf, tbf = rand_flagged(KB * M)
         av = reshape(Af.val, KB, M); afl = reshape(Af.flag, KB, M); ta = reshape(taf, KB, M)
         bv = reshape(Bf.val, KB, M); bfl = reshape(Bf.flag, KB, M); tb = reshape(tbf, KB, M)
-        if mode == :sparse
-            keep = falses(KB, M)
-            for r in 1:KB, _ in 1:2; keep[r, rand(rng, 1:M)] = true; end
-            av = ifelse.(keep, av, 0f0); afl = ifelse.(keep, afl, 0x00); ta = ifelse.(keep, ta, 0.0)
-            bv = ifelse.(keep, bv, 0f0); bfl = ifelse.(keep, bfl, 0x00); tb = ifelse.(keep, tb, 0.0)
+        if mode == :sparse                                # independent masks for A and B
+            keepA = falses(KB, M); keepB = falses(KB, M)
+            for r in 1:KB, _ in 1:2
+                keepA[r, rand(rng, 1:M)] = true; keepB[r, rand(rng, 1:M)] = true
+            end
+            av = ifelse.(keepA, av, 0f0); afl = ifelse.(keepA, afl, 0x00); ta = ifelse.(keepA, ta, 0.0)
+            bv = ifelse.(keepB, bv, 0f0); bfl = ifelse.(keepB, bfl, 0x00); tb = ifelse.(keepB, tb, 0.0)
         elseif mode == :positive
             av = abs.(av); bv = abs.(bv); ta = abs.(ta); tb = abs.(tb)
             afl = afl .& ~SUNK; bfl = bfl .& ~SUNK
@@ -365,7 +391,21 @@ function self_test()
     reg6 = r1.flag[1] == SUNK && r1.val[1] == 6f0
     println("  audit counterexample (2,SUNK)×(3,=): val=$(r1.val[1]) flag=$(Int(r1.flag[1])) " *
             "= exact magnitude + unknown sign $(reg6 ? "✓" : "✗")")
-    @assert bad6 == 0 && reg6
+    # Round-3 regressions: a displayed-zero-but-free term must not be treated as dead
+    rA = group_mul(T1, Tot(reshape(Float32[0.0], 1, 1), reshape(UInt8[GE|LE|SUNK], 1, 1)),
+                       Tot(reshape(Float32[3.0], 1, 1)))
+    regA = rA.flag[1] == (GE | LE | SUNK)
+    println("  counterexample 1 (0,GE|LE|SUNK)×(3,=): flag=$(Int(rA.flag[1])) $(regA ? "✓" : "✗")")
+    T2c = wiring_tensor(:cyclic, 2)
+    rB = group_mul(T2c, Tot(reshape(Float32[2.0, 0.0], 1, 2), reshape(UInt8[0x00, GE|LE|SUNK], 1, 2)),
+                        Tot(reshape(Float32[3.0, 1.0], 1, 2)))
+    regB = all(rB.flag .== (GE | LE | SUNK))
+    println("  counterexample 2 cyclic M=2 hidden term: flags=$(Int.(vec(rB.flag))) $(regB ? "✓" : "✗")")
+    # SUNK-only addition (our own find): |±2±3| ∈ {1,5} ⟹ exact-magnitude would be a lie
+    rC = tot_add(Tot(Float32[2.0], UInt8[SUNK]), Tot(Float32[3.0], UInt8[SUNK]))
+    regC = rC.flag[1] == (GE | LE | SUNK)
+    println("  (2,SUNK)+(3,SUNK): flag=$(Int(rC.flag[1])) = no-bound+SUNK $(regC ? "✓" : "✗")")
+    @assert bad6 == 0 && reg6 && regA && regB && regC
 
     println()
     println("TotalArith.jl: totality (no NaN, honest flags) + wiring swap + " *

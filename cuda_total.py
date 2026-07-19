@@ -49,7 +49,11 @@ class Tot:
        flag=None（利用者の 入口）では 入力を **全域化してから** 受け入れる:
        NaN→(0, 境界なし+SUNK) / ±Inf・float32範囲外→±MAX+GE / 非正規化数→±MIN+LE。
        「NaN/Inf を 決して 作らない」は この入口で 初めて 不変条件になる
-       （外部AI監査 2026-07-19: 旧版は 入口が 素通しで 0×Inf=NaN の 経路が あった）。"""
+       （外部AI監査 2026-07-19: 旧版は 入口が 素通しで 0×Inf=NaN の 経路が あった）。
+
+       **flag を 明示的に 渡す 経路は 内部用（unsafe）**: val が 全域化済みであることは
+       呼び出し側の 責任で、検査しない（演算関数が 生成する 値は 常に 全域化済み）。
+       外部からは Tot(x) の 1 引数形を 使うこと。"""
     __slots__ = ('val', 'flag')
     def __init__(self, val, flag=None):
         if flag is None:
@@ -86,11 +90,13 @@ def tot_add(a, b):
     raw = a.val.double() + b.val.double()
     val, sflag = _sat(raw, a.device)
     fin = a.flag | b.flag
-    anyb = (fin & (GE | LE)) > 0
     sign_known = (fin & SUNK) == 0
     same_sign = (torch.sign(a.val) * torch.sign(b.val)) > 0        # 厳密（0 は 同符号に 含めない）
     cancel = ~(sign_known & same_sign)
-    f = torch.where(anyb & cancel, torch.full_like(fin, GE | LE | SUNK), fin)
+    # 相殺可能 × フラグあり → 境界なし+SUNK。境界(GE/LE)だけでなく **SUNK 単独でも 落とす**:
+    # (2,SUNK)+(3,SUNK) の 真値は ±2±3 ⟹ |真| ∈ {1,5} で 大きさ厳密が 壊れる
+    # （第3ラウンド監査の 指摘を 受けた 自前オラクル強化で 発見・2026-07-19）。
+    f = torch.where((fin > 0) & cancel, torch.full_like(fin, GE | LE | SUNK), fin)
     return Tot(val, sflag | f)
 
 def tot_div(a, b):
@@ -176,7 +182,16 @@ def group_mul(T, a, b):
         ss = torch.sign(T[k, ii, jj])
         ai, bj = a.val[..., ii], b.val[..., jj]
         fa, fb = a.flag[..., ii], b.flag[..., jj]
-        live = (ai != 0) & (bj != 0)
+        # 「表示が0」≠「本当に0」（第3ラウンド監査 2026-07-19 の 指摘）。
+        #   確実に0 = 表示0 かつ GEビットなし（|真|≤0 ⟹ 真=0）→ 死項として 除外してよい。
+        #   危険な0 = 表示0 だが GEビットあり（真値は 任意/符号不明）→ 消してはならない:
+        #             その項が 触る 成分は 境界なし+SUNK に 落とす。_sat(NaN)=(0,7) が この形。
+        defz_a = (ai == 0) & ((fa & GE) == 0)
+        defz_b = (bj == 0) & ((fb & GE) == 0)
+        dead = defz_a | defz_b
+        danger_t = ~dead & (((ai == 0) & ((fa & GE) > 0)) | ((bj == 0) & ((fb & GE) > 0)))
+        danger = danger_t.any(dim=-1)
+        live = ~dead & ~danger_t
         tf = torch.where(live, _mul_flags(fa, fb), torch.zeros_like(fa))   # 項ごとの E1
         touched = ((tf | (torch.where(live, fa | fb, torch.zeros_like(fa)))) > 0).any(dim=-1)
         sunk_any = ((((fa | fb) & SUNK) > 0) & live).any(dim=-1)
@@ -195,6 +210,8 @@ def group_mul(T, a, b):
         p0 = ~touched
         fk = torch.where(p0, torch.zeros_like(f2), torch.where(keep, f2, NBv))
         sk = ~p0 & (~keep | (sunk_any & (n_live == 1)))
+        fk = torch.where(danger, NBv, fk)                       # 危険な0 が 触った 成分
+        sk = sk | danger
         outf[..., k] = fk
         outsunk[..., k] = sk
     f = sflag | outf | outsunk.to(torch.uint8) * SUNK
@@ -308,21 +325,31 @@ def self_test():
     K = 200_000
     rng5 = np.random.default_rng(11)
     def rand_flagged(K):
-        mag = torch.tensor(10.0 ** rng5.uniform(-20, 20, K), device=dev)
+        """第3ラウンド監査の 盲点指摘を 反映: 表示0のフラグ付き(12%)・SUNK単独・
+           GE|LE|SUNK・倍率は 10^6 まで・±MIN 近傍も 生成。"""
+        mag = torch.tensor(10.0 ** rng5.uniform(-35, 20, K), device=dev)
         sgn = torch.tensor(rng5.choice([-1.0, 1.0], K), device=dev)
         val = (mag * sgn).to(F32)
-        fl = torch.tensor(rng5.choice([0, GE, LE, GE | SUNK, LE | SUNK, GE | LE], K).astype(np.uint8),
-                          device=dev)
-        u = torch.tensor(rng5.uniform(0, 1, K), device=dev)
+        zero = torch.tensor(rng5.random(K) < 0.12, device=dev)
+        val = torch.where(zero, torch.zeros_like(val), val)
+        fl = torch.tensor(rng5.choice(
+            [0, GE, LE, SUNK, GE | SUNK, LE | SUNK, GE | LE, GE | LE | SUNK], K).astype(np.uint8),
+            device=dev)
         ge_, le_ = (fl & GE) > 0, (fl & LE) > 0
+        u = torch.tensor(rng5.uniform(0, 1, K), device=dev)
+        big = torch.tensor(10.0 ** rng5.uniform(0, 6, K), device=dev)   # 無制限側の 倍率
         m = torch.ones(K, dtype=torch.float64, device=dev)
-        m = torch.where(ge_ & ~le_, 1 + 7 * u, m)               # GE: |真| ∈ |val|·[1,8]
+        m = torch.where(ge_ & ~le_, 1 + big * u, m)              # GE: |真| ≥ |val|・上は 自由
         m = torch.where(le_ & ~ge_, u, m)                        # LE: |真| ∈ |val|·[0,1]
-        m = torch.where(ge_ & le_, 8 * u, m)                     # 境界なし: 何でも
-        ts = torch.where((fl & SUNK) > 0,
+        m = torch.where(ge_ & le_, big * u, m)                   # 境界なし: 何でも
+        freemag = torch.tensor(10.0 ** rng5.uniform(-38, 20, K), device=dev)
+        magt = torch.where(zero, torch.where(ge_, freemag, torch.zeros_like(freemag)),
+                           val.double().abs() * m)               # 表示0+GEビット ⟹ 真値自由
+        sgn_unknown = ((fl & SUNK) > 0) | (zero & ge_)
+        ts = torch.where(sgn_unknown,
                          torch.tensor(rng5.choice([-1.0, 1.0], K), device=dev).double(),
-                         torch.sign(val).double())               # SUNK: 符号も 乱択
-        tv = val.double().abs() * m * ts
+                         torch.sign(val).double())
+        tv = magt * ts
         tt = Tot(val); tt.flag = fl
         return tt, tv
     A2, ta = rand_flagged(K); B2, tb = rand_flagged(K)
@@ -330,16 +357,18 @@ def self_test():
     for name, op in [("mul", tot_mul), ("add", tot_add), ("div", tot_div)]:
         r = op(A2, B2)
         t = {"mul": ta * tb, "add": ta + tb,
-             "div": torch.where(tb == 0, torch.zeros_like(ta),
+             "div": torch.where(tb == 0, torch.zeros_like(ta),          # 真の分母0 ⟹ 規約 a/0=0
                                 ta / torch.where(tb == 0, torch.ones_like(tb), tb))}[name]
         ge = (r.flag & GE) > 0; le = (r.flag & LE) > 0; sk = (r.flag & SUNK) > 0
         vo = r.val.double(); slack = 2.0 ** -20                  # f32 丸め分の 猶予
         lies5 += int((ge & ~le & (t.abs() < vo.abs() * (1 - slack))).sum())
         lies5 += int((le & ~ge & (t.abs() > vo.abs() * (1 + slack))).sum())
+        lies5 += int((~ge & ~le                                  # GE/LEなし = 大きさ厳密の 主張
+                      & ((t.abs() - vo.abs()).abs() > vo.abs() * slack)).sum())
         lies5 += int(((~sk) & (vo != 0) & (t != 0)
                       & (torch.sign(t) != torch.sign(vo))).sum())  # 符号は 値が 運ぶ（SUNK 以外）
         lies5 += int(torch.isnan(r.val).sum() + torch.isinf(r.val).sum())
-    print(f"  {3*K:,} 件: 嘘 **{lies5}**（片側境界・符号・無NaN の 三契約）")
+    print(f"  {3*K:,} 件: 嘘 **{lies5}**（片側境界・大きさ厳密・符号・無NaN の 四契約）")
     assert lies5 == 0
 
     print()
@@ -353,14 +382,14 @@ def self_test():
     def check6(label, kind, M, KB, mode):
         T = wiring_tensor(kind, M, dev)
         A, ta = rand_flagged_mat(KB, M); B, tb = rand_flagged_mat(KB, M)
-        if mode == "sparse":                                    # 2成分だけ 非ゼロ
-            keep = torch.zeros(KB, M, dtype=torch.bool, device=dev)
-            keep.scatter_(1, torch.randint(0, M, (KB, 2), device=dev), True)
-            for X, tx in ((A, ta), (B, tb)):
+        if mode == "sparse":                                    # 2成分だけ 非ゼロ（A/B 独立マスク）
+            for X, txname in ((A, "a"), (B, "b")):
+                keep = torch.zeros(KB, M, dtype=torch.bool, device=dev)
+                keep.scatter_(1, torch.randint(0, M, (KB, 2), device=dev), True)
                 X.val = torch.where(keep, X.val, torch.zeros_like(X.val))
                 X.flag = torch.where(keep, X.flag, torch.zeros_like(X.flag))
-            ta = torch.where(keep, ta, torch.zeros_like(ta))
-            tb = torch.where(keep, tb, torch.zeros_like(tb))
+                if txname == "a": ta = torch.where(keep, ta, torch.zeros_like(ta))
+                else:             tb = torch.where(keep, tb, torch.zeros_like(tb))
         elif mode == "positive":                                # 全正・符号既知
             for X in (A, B):
                 X.val = X.val.abs(); X.flag = X.flag & ~SUNK
@@ -390,7 +419,23 @@ def self_test():
     reg6 = int(r1.flag.item()) == SUNK and float(r1.val.item()) == 6.0
     print(f"  原反例 (2,SUNK)×(3,=): val={r1.val.item():g} flag={int(r1.flag.item())} "
           f"= 大きさ厳密+符号不明 {'✓' if reg6 else '×'}")
-    assert bad6 == 0 and reg6
+    # 第3ラウンド回帰: 「表示0 だが 真値自由」の 項を 死項にしない
+    z = Tot(torch.tensor([[0.0]], device=dev)); z.flag = torch.tensor([[GE | LE | SUNK]], dtype=torch.uint8, device=dev)
+    rA = group_mul(T1, z, Tot(torch.tensor([[3.0]], device=dev)))
+    regA = int(rA.flag.item()) == (GE | LE | SUNK)
+    print(f"  反例1 (0,GE|LE|SUNK)×(3,=): flag={int(rA.flag.item())} = 境界なし+SUNK {'✓' if regA else '×（旧: 0=嘘）'}")
+    T2c = wiring_tensor("cyclic", 2, dev)
+    a2 = Tot(torch.tensor([[2.0, 0.0]], device=dev)); a2.flag = torch.tensor([[0, GE | LE | SUNK]], dtype=torch.uint8, device=dev)
+    rB = group_mul(T2c, a2, Tot(torch.tensor([[3.0, 1.0]], device=dev)))
+    regB = all(int(f) == (GE | LE | SUNK) for f in rB.flag[0])
+    print(f"  反例2 巡回M=2 隠れ項: flag={rB.flag[0].tolist()} = 両成分 境界なし+SUNK {'✓' if regB else '×（旧: [0,0]=嘘）'}")
+    # SUNK単独 加算の 回帰（第3ラウンドを 受けた 自前発見）: |±2±3| ∈ {1,5} ⟹ 大きさ厳密は 嘘
+    su = Tot(torch.tensor([2.0], device=dev)); su.flag = torch.tensor([SUNK], dtype=torch.uint8, device=dev)
+    sv = Tot(torch.tensor([3.0], device=dev)); sv.flag = torch.tensor([SUNK], dtype=torch.uint8, device=dev)
+    rC = tot_add(su, sv)
+    regC = int(rC.flag.item()) == (GE | LE | SUNK)
+    print(f"  (2,SUNK)+(3,SUNK): flag={int(rC.flag.item())} = 境界なし+SUNK {'✓' if regC else '×（旧: SUNK=大きさ厳密の嘘）'}")
+    assert bad6 == 0 and reg6 and regA and regB and regC
 
     print()
     print("GPU 版: 全域算術（無NaN・フラグ）+ 配線表差し替え + 飽和は最後に1回、が torch で 動く。")
