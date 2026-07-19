@@ -76,11 +76,27 @@ def _mul_flags(fa, fb):
     out = out.to(torch.uint8) | ((fa | fb) & SUNK)
     return out
 
+def _danger_zero(v, f):
+    """危険な0 = 表示0 かつ GEビット（真値の 大きさ・符号が 自由）。_sat(NaN) が この形。"""
+    return (v == 0) & ((f & GE) > 0)
+
+def _true_zero(v, f):
+    """本当の0 = 表示0 かつ GEビットなし（|真|≤0 ⟹ 真=0）。**符号なし** — 向きは ±MIN が 運ぶ。"""
+    return (v == 0) & ((f & GE) == 0)
+
 def tot_mul(a, b):
     raw = a.val.double() * b.val.double()
     # x×0=0 厳密（IEEE で 0×inf は 出ない: 入力に inf が 無い 不変条件）
     val, sflag = _sat(raw, a.device)
-    return Tot(val, sflag | _mul_flags(a.flag, b.flag))
+    f = sflag | _mul_flags(a.flag, b.flag)
+    # 危険な0 は 符号も 不明 — group_mul と 同一意味論を スカラーにも
+    # （第4ラウンド監査 2026-07-19: (0,GE)×(3,=) の 真の積は ±6 なのに SUNK が 欠けていた）。
+    danger = _danger_zero(a.val, a.flag) | _danger_zero(b.val, b.flag)
+    f = f | danger.to(torch.uint8) * SUNK
+    # 本当の0（符号なし）は 万物を 吸収: (0,厳密)×(x,任意フラグ) の 真の積は 厳密に 0
+    # ⟹ 出力は (0, フラグなし)。相手の 不確かさは 消える（利用者の 教義: x×0=0 厳密）。
+    tz = _true_zero(a.val, a.flag) | _true_zero(b.val, b.flag)
+    return Tot(val, torch.where(tz, torch.zeros_like(f), f))
 
 def tot_add(a, b):
     """加算の フラグ則（2026-07-19 改訂・外部AI監査の 反例 (+MIN,LE)+(−MIN,=)→(0,LE) を 受けて）:
@@ -108,7 +124,10 @@ def tot_div(a, b):
     nb = (fin & (GE | LE)) > 0                                  # 入力に 境界 → 商は 保守的に 境界なし
     f = sflag | torch.where(nb, torch.full_like(fin, GE | LE), torch.zeros_like(fin)) \
         | (fin & SUNK)
-    return Tot(val, f)
+    # 危険な0（分母: 表示0でも 真の分母≠0 なら 商は ±・分子: 真の商の 符号不明）→ SUNK
+    # （第4ラウンド監査: (1,=)/(0,GE) の 真の商は ±0.5 なのに SUNK が 欠けていた）。
+    danger = _danger_zero(a.val, a.flag) | _danger_zero(b.val, b.flag)
+    return Tot(val, f | danger.to(torch.uint8) * SUNK)
 
 
 # ---------------------------------------------------------------- 配線表（構造テンソル）
@@ -342,23 +361,33 @@ def self_test():
         m = torch.where(ge_ & ~le_, 1 + big * u, m)              # GE: |真| ≥ |val|・上は 自由
         m = torch.where(le_ & ~ge_, u, m)                        # LE: |真| ∈ |val|·[0,1]
         m = torch.where(ge_ & le_, big * u, m)                   # 境界なし: 何でも
-        freemag = torch.tensor(10.0 ** rng5.uniform(-38, 20, K), device=dev)
-        magt = torch.where(zero, torch.where(ge_, freemag, torch.zeros_like(freemag)),
-                           val.double().abs() * m)               # 表示0+GEビット ⟹ 真値自由
-        sgn_unknown = ((fl & SUNK) > 0) | (zero & ge_)
-        ts = torch.where(sgn_unknown,
-                         torch.tensor(rng5.choice([-1.0, 1.0], K), device=dev).double(),
-                         torch.sign(val).double())
-        tv = magt * ts
+        def draw_true():
+            """同一の (val, flag) から 許容真値を 独立に 引く（二証人 方式・第4ラウンド）。"""
+            u2 = torch.tensor(rng5.uniform(0, 1, K), device=dev)
+            big2 = torch.tensor(10.0 ** rng5.uniform(0, 6, K), device=dev)
+            m2 = torch.ones(K, dtype=torch.float64, device=dev)
+            m2 = torch.where(ge_ & ~le_, 1 + big2 * u2, m2)
+            m2 = torch.where(le_ & ~ge_, u2, m2)
+            m2 = torch.where(ge_ & le_, big2 * u2, m2)
+            freemag = torch.tensor(10.0 ** rng5.uniform(-38, 20, K), device=dev)
+            magt = torch.where(zero, torch.where(ge_, freemag, torch.zeros_like(freemag)),
+                               val.double().abs() * m2)          # 表示0+GEビット ⟹ 真値自由
+            sgn_unknown = ((fl & SUNK) > 0) | (zero & ge_)
+            ts = torch.where(sgn_unknown,
+                             torch.tensor(rng5.choice([-1.0, 1.0], K), device=dev).double(),
+                             torch.sign(val).double())
+            return magt * ts
         tt = Tot(val); tt.flag = fl
-        return tt, tv
-    A2, ta = rand_flagged(K); B2, tb = rand_flagged(K)
+        return tt, draw_true(), draw_true()
+    A2, ta, ta2 = rand_flagged(K); B2, tb, tb2 = rand_flagged(K)
     lies5 = 0
+    def truth(name, x, y):
+        return {"mul": x * y, "add": x + y,
+                "div": torch.where(y == 0, torch.zeros_like(x),          # 真の分母0 ⟹ 規約 a/0=0
+                                   x / torch.where(y == 0, torch.ones_like(y), y))}[name]
     for name, op in [("mul", tot_mul), ("add", tot_add), ("div", tot_div)]:
         r = op(A2, B2)
-        t = {"mul": ta * tb, "add": ta + tb,
-             "div": torch.where(tb == 0, torch.zeros_like(ta),          # 真の分母0 ⟹ 規約 a/0=0
-                                ta / torch.where(tb == 0, torch.ones_like(tb), tb))}[name]
+        t = truth(name, ta, tb); t2 = truth(name, ta2, tb2)
         ge = (r.flag & GE) > 0; le = (r.flag & LE) > 0; sk = (r.flag & SUNK) > 0
         vo = r.val.double(); slack = 2.0 ** -20                  # f32 丸め分の 猶予
         lies5 += int((ge & ~le & (t.abs() < vo.abs() * (1 - slack))).sum())
@@ -367,8 +396,11 @@ def self_test():
                       & ((t.abs() - vo.abs()).abs() > vo.abs() * slack)).sum())
         lies5 += int(((~sk) & (vo != 0) & (t != 0)
                       & (torch.sign(t) != torch.sign(vo))).sum())  # 符号は 値が 運ぶ（SUNK 以外）
+        # 第4ラウンドの 2契約: SUNKなし ⟹ ①表示0なら 真も0 ②二証人の 符号が 割れない
+        lies5 += int(((~sk) & (vo == 0) & (t != 0)).sum())
+        lies5 += int(((~sk) & (torch.sign(t) * torch.sign(t2) < 0)).sum())
         lies5 += int(torch.isnan(r.val).sum() + torch.isinf(r.val).sum())
-    print(f"  {3*K:,} 件: 嘘 **{lies5}**（片側境界・大きさ厳密・符号・無NaN の 四契約）")
+    print(f"  {3*K:,} 件×二証人: 嘘 **{lies5}**（片側境界・大きさ厳密・符号・表示0・証人一致・無NaN）")
     assert lies5 == 0
 
     print()
@@ -376,7 +408,7 @@ def self_test():
     print("⑥ group_mul の オラクル検査（第2ラウンド SUNK 指摘 + パターン則の 健全性/保持率）")
     print("=" * 76)
     def rand_flagged_mat(KB, M):
-        tt, tv = rand_flagged(KB * M)
+        tt, tv, _ = rand_flagged(KB * M)
         m = Tot(tt.val.reshape(KB, M)); m.flag = tt.flag.reshape(KB, M)
         return m, tv.reshape(KB, M)
     def check6(label, kind, M, KB, mode):
@@ -435,7 +467,26 @@ def self_test():
     rC = tot_add(su, sv)
     regC = int(rC.flag.item()) == (GE | LE | SUNK)
     print(f"  (2,SUNK)+(3,SUNK): flag={int(rC.flag.item())} = 境界なし+SUNK {'✓' if regC else '×（旧: SUNK=大きさ厳密の嘘）'}")
-    assert bad6 == 0 and reg6 and regA and regB and regC
+    # 第4ラウンド回帰: 危険な0 の 意味論を スカラー演算にも（group_mul とだけ 一致していた）
+    dz = Tot(torch.tensor([0.0], device=dev)); dz.flag = torch.tensor([GE], dtype=torch.uint8, device=dev)
+    e3 = Tot(torch.tensor([3.0], device=dev))
+    rD = tot_mul(dz, e3)
+    regD = (int(rD.flag.item()) & SUNK) > 0
+    print(f"  (0,GE)×(3,=): flag={int(rD.flag.item())} SUNKあり {'✓' if regD else '×（旧: GE のみ=符号の嘘）'}")
+    e1 = Tot(torch.tensor([1.0], device=dev))
+    rE = tot_div(e1, dz)
+    regE = int(rE.flag.item()) == (GE | LE | SUNK)
+    print(f"  (1,=)/(0,GE): flag={int(rE.flag.item())} = 境界なし+SUNK {'✓' if regE else '×（旧: SUNKなし）'}")
+    dz7 = Tot(torch.tensor([0.0], device=dev)); dz7.flag = torch.tensor([GE | LE | SUNK], dtype=torch.uint8, device=dev)
+    rF = tot_div(e1, dz7)
+    regF = int(rF.flag.item()) == (GE | LE | SUNK)
+    print(f"  (1,=)/(0,GE|LE|SUNK): flag={int(rF.flag.item())} {'✓' if regF else '×'}")
+    # 本当の0（符号なし・向きは±MINが運ぶ）は 吸収: (0,=)×(3,GE) → (0, フラグなし)
+    e3g = Tot(torch.tensor([3.0], device=dev)); e3g.flag = torch.tensor([GE], dtype=torch.uint8, device=dev)
+    rG = tot_mul(Tot(torch.tensor([0.0], device=dev)), e3g)
+    regG = int(rG.flag.item()) == 0 and float(rG.val.item()) == 0.0
+    print(f"  (0,=)×(3,GE): flag={int(rG.flag.item())} = 厳密な真の0 {'✓' if regG else '×'}")
+    assert bad6 == 0 and reg6 and regA and regB and regC and regD and regE and regF and regG
 
     print()
     print("GPU 版: 全域算術（無NaN・フラグ）+ 配線表差し替え + 飽和は最後に1回、が torch で 動く。")
