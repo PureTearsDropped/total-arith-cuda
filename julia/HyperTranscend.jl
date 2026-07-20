@@ -1,8 +1,11 @@
 # ⚠️ AI-assisted; verify. / 生成AI使用・要検証
 """
-HyperTot — analytic functions (exp, log, sqrt, ^) for a hypercomplex number of ANY
-dimension M = 2^k (real / complex / quaternion / octonion / sedenion / …), computed
-uniformly through the structure tensor and the regular representation.
+HyperTranscend — an **experimental** unified computation of transcendental functions
+(exp, log, sqrt, ^) for a hypercomplex number of any dimension M = 2^k, via the LEFT
+regular representation.  These are *function values defined through L_x*, not a claim
+that every hypercomplex analytic function is captured; which algebraic identities hold
+is CHECKED per dimension in `self_test()`, not assumed (for non-associative M ≥ 8 the
+branch of a matrix function, and left- vs right-functions, need case-by-case care).
 
   Core identity (this session's result):
       a hypercomplex element x  ≙  its left-multiplication matrix  L_x  (M×M),
@@ -22,6 +25,7 @@ uniformly through the structure tensor and the regular representation.
 module HyperTranscend
 
 using LinearAlgebra
+import Random
 export Hyper, hexp, hlog, hsqrt, e0, isreal_ok, flags, SING, CPLX, OVER
 
 const SING = 0x01
@@ -103,23 +107,37 @@ function _singular(L)
     s = svdvals(L)
     s[end] <= 1e-9 * max(s[1], 1.0)          # smallest singular value ~ 0
 end
-function _matfun(f, x::Hyper; inverse::Bool)
+# `needs_inverse`: only ops that literally invert (log, x^negative) require L_x nonsingular.
+# √ and x^(positive) do NOT — √0 = 0 is fine even though L_0 is singular. So we flag SING
+# *only when the matrix function actually fails*, not preemptively (external AI review found
+# hsqrt(0) was a false positive: a well-defined op reported as a zero-divisor failure).
+function _matfun(f, x::Hyper; needs_inverse::Bool)
     M = dim(x); L = Lmatrix(x); flag = x.flag
-    if inverse && _singular(L)
-        return Hyper(zeros(M), flag | SING)   # zero divisor: no unique answer, named
+    all(iszero, x.c) && return Hyper(zeros(M), flag)   # f(0): resolved directly (√0=0, 0^p=0)
+    if needs_inverse && _singular(L)
+        return Hyper(zeros(M), flag | SING)            # inversion of a zero divisor: no answer
     end
-    Y = try f(L) catch; return Hyper(zeros(M), flag | SING) end
-    v = Y * e0(M)
+    v = try
+        Y = f(L); Y * e0(M)
+    catch
+        return Hyper(zeros(M), flag | SING)            # matrix function genuinely failed
+    end
     imres = maximum(abs.(imag.(v)))
     rmag  = max(maximum(abs.(real.(v))), 1.0)
-    (imres > 1e-8 * rmag) && (flag |= CPLX)   # left the reals ⇒ bigger field
+    (imres > 1e-8 * rmag) && (flag |= CPLX)            # left the reals ⇒ bigger field
     _tot(Hyper(real.(v), flag))
 end
-hlog(x::Hyper)  = _matfun(log, x;  inverse=true)
-hsqrt(x::Hyper) = _matfun(sqrt, x; inverse=true)
-Base.:^(x::Hyper, p::Real) = isinteger(p) && p >= 0 ?
-    _matfun(A -> A^Int(p), x; inverse=false) :   # nonneg integer power: forward, total
-    _matfun(A -> A^float(p), x; inverse=true)    # fractional/neg: needs inverse
+hlog(x::Hyper)  = _matfun(log,  x; needs_inverse=true)    # log(0)=−∞, log(zero-div) singular
+hsqrt(x::Hyper) = _matfun(sqrt, x; needs_inverse=false)   # √ never needs inversion
+function Base.:^(x::Hyper, p::Real)
+    if isinteger(p) && p >= 0
+        _matfun(A -> A^Int(p),   x; needs_inverse=false)  # forward, total
+    elseif p > 0
+        _matfun(A -> A^float(p), x; needs_inverse=false)  # positive fractional: no inversion
+    else
+        _matfun(A -> A^float(p), x; needs_inverse=true)   # negative power: needs inverse
+    end
+end
 
 isreal_ok(x::Hyper) = (x.flag & (SING | CPLX)) == 0
 function Base.show(io::IO, x::Hyper)
@@ -128,4 +146,38 @@ function Base.show(io::IO, x::Hyper)
     print(io, "Hyper", dim(x), "(", join(round.(x.c, digits=4), ","), ")", tag)
 end
 
+# ---- self-test: algebraic identities per dimension + the audit regressions ----
+function self_test()
+    println("HyperTranscend self-test — identities are CHECKED, not assumed")
+    rng = Random.MersenneTwister(7)
+    approx(a::Hyper, b::Hyper) = maximum(abs.(a.c .- b.c)) < 1e-6
+    for M in (1, 2, 4, 8, 16)
+        x = Hyper([1.4; 0.25 .* randn(rng, M-1)])       # near identity: log/√ well-conditioned
+        oks = [
+            ("√x·√x==x",        approx(hsqrt(x)*hsqrt(x), x)),
+            ("exp(log x)==x",   approx(hexp(hlog(x)), x)),
+            ("x^2==x·x",        approx(x^2, x*x)),
+            ("x^0.5·x^0.5==x",  approx((x^0.5)*(x^0.5), x)),
+        ]
+        s = join(["$n $(v ? "✓" : "✗")" for (n,v) in oks], "  ")
+        println("  M=$M: $s")
+        @assert all(v for (_,v) in oks)
+    end
+    # audit regressions (external AI review 2026-07-20): √0 / 0^p must NOT false-flag
+    for f in (hsqrt, x->x^0.5, x->x^2.5)
+        r = f(Hyper([0.0]))
+        @assert flags(r) == 0x00 && r.c[1] == 0.0 "√0 / 0^p wrongly flagged"
+    end
+    println("  regression √0=0, 0^0.5=0, 0^2.5=0 — no false zero-divisor flag ✓")
+    # a genuine zero divisor: forward exp ok, inverse (log) flagged
+    z = Hyper([i∈(4,11) ? 1.0 : 0.0 for i in 1:16])
+    @assert flags(hexp(z)) & SING == 0 "exp(zero-divisor) should stay total"
+    @assert flags(hlog(z)) & SING != 0 "log(zero-divisor) should be flagged"
+    println("  zero divisor z=e3+e10: exp forward-total, log flagged ⟦零因子⟧ ✓")
+end
+
 end # module
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    HyperTranscend.self_test()
+end
