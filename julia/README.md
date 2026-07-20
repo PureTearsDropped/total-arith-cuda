@@ -10,6 +10,17 @@ All three are standalone (stdlib only) and carry the ⚠️ AI-assisted banner. 
 | **`NestedSeries.jl`** | `NestedSeries` | The M/N/O layers as **freely composable registries** over one `Alg` interface: cells (`cd_alg`/`cyclic_alg`/`matn_alg`) × combinators (`mat_over`, `tensor`, `jordan` (symmetrized a∘b=(ab+ba)/2) — recursive: `mat_over(tensor(cd_alg(4),cd_alg(2)),2)` just works) × coefficient tapes (`:exp :sin :cos :sinh :cosh` + user-defined). Nothing assumed per combination: `assoc_defect`/`powerassoc_defect`/`commut_defect` measure the composed algebra, `nlog` verifies with forward exp or flags INEXACT. Measured law: **exp∘log verifies iff POWER-associativity holds** — octonion/sedenion scalars (non-associative, power-associative) verify at 1e-16; `mat2⟨cd16⟩` loses power-associativity (0.97) and breaks structurally (7e-3). Second measured law: a non-associative ⊗-base keeps power-associativity **only when the partner is commutative AND associative** — the `jordan` pincer (commutative, non-associative) shows commutativity alone fails. `ninv` = division rebuilt as the all-ones tape Σu^k, verified two-sided, INEXACT on zero divisors — no divider circuit. Two preset shelves: `OPS`/`nop(A,:sqrt,x)` (operators as data: forward vs candidate+verify) and `ALGS`/`alg(:dualquat)` (famous algebras as compositions — dual numbers Λ1 give forward-mode AD `f(a+ε)=f(a)+f′(a)ε`; `:dualquat`=Λ1⊗ℍ is the rigid-body pose algebra; Grassmann/Clifford cells included), with `list_ops`/`list_algs` printing measured id-cards. |
 | **`HyperTranscend.jl`** | `HyperTranscend` | **Experimental** unified computation of `exp`/`log`/`sqrt`/`^` for any M = 2^k via `f(x) = f(L_x)·e₀` (function values through the left regular representation — *not* a proof that every hypercomplex analytic function is captured; identities are **checked per dimension** in `self_test()`). Forward ops (`*`, `exp`, `x^{p≥0}`, `√`) stay total for every input incl. zero divisors — `√0 = 0` even though `L_0` is singular.  Only genuine **inversion** (`log`, `x^{neg}`) needs `L_x` nonsingular; a zero divisor there is named `⟦零因子⟧`. **Safe forward group** (`exp sin cos sinh cosh`, `x^{p≥0}` via `left_power` with explicit bracketing, `left_action(a,x0,t)=exp(t·L_a)·x0` for sedenion-valued linear ODEs) is total for every input. **Candidate group** (`sqrt log x^{frac}`) computes then **verifies the defining identity by a non-recursive residual** — trusted only if it holds, else flagged `⟦INEXACT⟧` (never a silent lie); `verify_sqrt`/`verify_log` are exposed for the caller. |
 
+## `TotalPipeline.jl` — U → V(O,N,M) → W, named (Julia twin of `total_pipeline.py`)
+
+The audited `HyperAlgebra` core already runs as U (entry totalization) → V (fused Float64
+MAC) → W (saturate-once + pattern-rule flags), with N (the wiring tensor) swappable and M
+implicit. This module names that architecture without touching the core: `papply(op, a, b;
+algebra=…)` is the one gateway (asserted bit-identical to direct kernel calls),
+`from_kind`/`from_registry` fill the N slot — the latter bridges the **NestedSeries ALGS
+shelf** (dualquat, Clifford, Grassmann, …) onto the audited kernel with flags — `Lmatrix`
+exposes the explicit M (implicit ≡ explicit asserted), `TotalPipe(:gmul, algebra)` is the
+declarative pair. `julia TotalPipeline.jl` runs the five-way self-test.
+
 ## `demo_ode_blowup.jl` — a third-party solver, unchanged, naming the blow-up
 
 Run `julia demo_ode_blowup.jl` (needs `OrdinaryDiffEq`, which you install yourself —
