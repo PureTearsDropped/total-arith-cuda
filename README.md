@@ -151,7 +151,7 @@ algebra is a structure tensor `T[i,j,k]` (product = one einsum; `jordan`/`lie` =
 symmetrize/antisymmetrize T). Twin preset shelves: **`ALGS`** (13 named algebras incl.
 Grassmann Λn — Λ1 = dual numbers ⇒ forward-mode AD `f(a+ε)=f(a)+f′(a)ε`; Clifford;
 `dualquat` = Λ1⊗ℍ rigid-body pose) × **`OPS`** (`nop(A,'sqrt',x)` — forward vs
-candidate+verify). Probes measure every combination; measured laws asserted in
+candidate+verify). Third shelf **`IMPLS`**: bilinear ALGORITHMS in (U,V,W) normal form — same structure tensor T, different implementations (complex: naive R=4 vs Gauss R=3; 2×2 matmul: naive R=8 vs Strassen R=7; sedenion naive R=256); correctness is the tensor equation `Σ_r U⊗V⊗W ≡ T`, checked to 0.0, and algorithms COMPOSE by Kronecker product mirroring `tensor()` (gauss⊗gauss computes cd2⊗cd2 with R=9 < naive 16). Probes measure every combination; measured laws asserted in
 `python nested_registry.py`: exp∘log ⟺ power-associativity; ⊗-partner must be
 commutative AND associative; BCH repairs at s⁴ through octonions (Artin) and s³ at
 sedenions; Jacobi breaks at octonions.
