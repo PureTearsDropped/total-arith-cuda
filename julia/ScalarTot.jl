@@ -10,7 +10,7 @@ TotArith — a scalar total-arithmetic Number for Julia.
   Julia code runs on it unchanged* — the flag flows through any library that is written
   against `Number`/`Real` (ODE solvers, linear algebra, ...).  That is the whole point.
 """
-module TotArith
+module ScalarTot
 
 export TotNum, GE, LE, SUNK, isflagged, flag_of, MAXF, MINF
 
