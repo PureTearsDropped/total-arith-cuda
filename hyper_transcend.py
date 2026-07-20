@@ -75,9 +75,10 @@ def isreal_ok(x): return (x.flag & (SING | CPLX | INEXACT)) == 0
 # ---- structure-tensor multiply and the regular representation L_x ----
 def _mul(a, b):
     M = len(a); OM = cd_omega(M); r = np.zeros(M)
-    for i in range(M):
-        for j in range(M):
-            r[i ^ j] += OM[i, j] * a.c[i] * b.c[j]
+    with np.errstate(over="ignore", invalid="ignore"):   # raw overflow is _tot's job, not a warning's
+        for i in range(M):
+            for j in range(M):
+                r[i ^ j] += OM[i, j] * a.c[i] * b.c[j]
     return _tot(Hyper(r, int(a.flag | b.flag)))
 
 def Lmatrix(x):
