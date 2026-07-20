@@ -125,6 +125,18 @@ motor mixing as a wiring, and a differential-flatness speed envelope. Those demo
 surfaced a real library bug here — `group_mul` crashed on wiring tables with empty output
 rows (matrix-vector wirings produce them; hypercomplex ones never do), now fixed.
 
+### `cuda_fused.py` — the fused kernel (Triton): buys latency, sells no semantics
+
+One Triton kernel fuses the float64 MAC (saturate once) with the full pattern-rule flag
+algebra (P0–P4, definite/dangerous zeros, E1 retention, sign-consistency). Contract:
+**flags bit-identical, values float32-identical** to `cuda_total.group_mul` — asserted over
+adversarial batteries (560k components, 3 wirings, zero mismatches). Measured (RTX 5090,
+cd16, flagged): the legacy flagged path has a batch-independent ~36ms floor (per-component
+`.nonzero()` forces GPU↔CPU syncs); the fused kernel removes it — **B=1: 36.5ms → 63µs
+(582×)**, B=1024: 387×, B=16k: 32×, B=1M: parity. Large-batch clean inputs stay faster on
+the existing einsum path (memory-optimal there). The win is exactly the control-loop /
+per-sample regime — a 1 kHz attitude loop fits in 63µs, not in 36ms.
+
 ### `hyper_transcend.py` — transcendental functions for any-M hypercomplex (Python twin of Julia)
 
 `exp / log / sqrt / ^ / sin / cos / sinh / cosh` and a linear-ODE mover `left_action(a,x0,t)`
