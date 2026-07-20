@@ -39,7 +39,17 @@ struct Hyper
     c::Vector{Float64}
     flag::UInt8
 end
-Hyper(c::AbstractVector) = Hyper(Float64.(collect(c)), 0x00)
+# entry totalization: a component that is NaN/Inf/out-of-range is named at construction, so
+# no downstream matrix routine (svdvals/expm/…) can ever see a NaN and crash (LAPACK).
+# (external totality audit 2026-07-20: NaN-injected input crashed hlog/x^-1 via svdvals.)
+function Hyper(c::AbstractVector)
+    v = Float64.(collect(c)); f = 0x00
+    for i in eachindex(v)
+        if isnan(v[i]); v[i] = 0.0; f |= (OVER | SING)
+        elseif !isfinite(v[i]) || abs(v[i]) > MAXF; v[i] = sign(v[i]) * MAXF; f |= OVER; end
+    end
+    Hyper(v, f)
+end
 flags(x::Hyper) = x.flag
 dim(x::Hyper) = length(x.c)
 
@@ -101,6 +111,7 @@ end
 
 # inverse-type: guard the single failure point — L_x singular ⇒ flag, don't NaN
 function _singular(L)
+    all(isfinite, L) || return true          # 非有限は 特異扱い(svdvals=LAPACKを守る)
     s = svdvals(L)
     s[end] <= 1e-9 * max(s[1], 1.0)          # smallest singular value ~ 0
 end

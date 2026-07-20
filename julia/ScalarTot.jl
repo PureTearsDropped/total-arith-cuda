@@ -114,6 +114,8 @@ function Base.:^(a::TotNum, b::TotNum)
     x, y = a.val, b.val
     inflag = a.flag | b.flag
     # 指数=0 の 二種を 分ける（"0を予約語に"の 帰結）: 本物の0 だけが 空の積=1。
+    # 指数が 整数だが Int64 に 収まらない(1e300 等) → 実数冪 exp(y·log x) の 経路へ
+    # (旧版は isinteger(y) で 整数扱い→Int64(y) が InexactError を 投げた・全域監査で 発覚)
     if y == 0
         if b.flag == 0x00                          # 指数が **本物の0** → 空の積 → 1 (0^0 も 1)
             return TotNum(1.0, a.flag & SUNK)      # (底の 符号不明だけは 伝播・大きさは 1 で 確定)
@@ -128,7 +130,8 @@ function Base.:^(a::TotNum, b::TotNum)
     if x < 0 && !isinteger(y)                     # (負)^(非整数) = 実数の範囲外 → 型が違う
         return TotNum(0.0, inflag | CPLX)         # NaN でなく "複素へ" と名指し
     end
-    s = (x < 0 && isodd(Int(round(y)))) ? -1.0 : 1.0
+    # 負の底の 符号: 指数の 偶奇で 決まる。y が Int64 外(1e300 等)なら 実質 偶数扱いで 安全
+    s = (x < 0 && abs(y) < 9e18 && isodd(round(Int, y))) ? -1.0 : 1.0
     r = _sat(s * abs(x)^y)                         # 溢れ→±MAX·GE / 潰れ→±MIN·LE を _sat が担当
     TotNum(r.val, r.flag | inflag)
 end
