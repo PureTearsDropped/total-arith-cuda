@@ -103,13 +103,29 @@ Base.:(==)(a::TotNum, b::TotNum) = a.val == b.val
 Base.isless(a::TotNum, b::TotNum) = a.val < b.val
 Base.abs(a::TotNum) = TotNum(abs(a.val), a.flag)
 Base.sign(a::TotNum) = TotNum(sign(a.val), (a.flag & SUNK))
+# ---- transcendental flag algebra --------------------------------------------------------
+# GE/LE are ABSOLUTE-VALUE bounds. They survive a function ONLY when the function is
+# monotone on the admissible set AND the direction survives |·| — that must be PROVEN per
+# function, not assumed. Principle (external audit 2026-07-20, five confirmed lies):
+# when it cannot be proven, drop to GE|LE|SUNK (no bound, sign untrusted) — an honest
+# "I know nothing" beats a stale direction.
+const CPLX = 0x08   # "真の結果が real 欄に収まらない(可能性を含む)" — √-1型は確定・符号不明入力は可能性
+const NOB  = GE | LE                              # no bound in either direction
+
+# 符号を信用できない入力(SUNK / 危険な0)は、定義域が符号に敏感な関数では
+# 「真値が負→実数の外」の可能性を持つ ⇒ CPLX まで立てるのが健全 (意味論オラクルで強制)
+@inline _sign_untrusted(a::TotNum) = (a.flag & SUNK) != 0 || (a.val == 0 && (a.flag & GE) != 0)
+
 function Base.sqrt(a::TotNum)
-    r = _sat(sqrt(max(a.val, 0.0)))
-    TotNum(r.val, r.flag | a.flag)               # monotone: bound flags pass through
+    if a.val < 0                                            # 定義域外: 複素へ、と名指し
+        # 符号不明なら 真値が正で実結果もあり得る → 古い方向ビットを残さず NOB に落とす
+        return (a.flag & SUNK) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) : TotNum(0.0, a.flag | CPLX)
+    end
+    _sign_untrusted(a) && return TotNum(sqrt(a.val), NOB | SUNK | CPLX)
+    # sign trusted, val ≥ 0: |·|^½ is monotone in magnitude → direction bits survive
+    r = _sat(sqrt(a.val))
+    TotNum(r.val, r.flag | (a.flag & (GE | LE)))
 end
-# scalar transcendentals the solver machinery reaches for — each totalized (wrap + flag).
-# ^ / exp overflow easily, so totalizing them is not just glue but honest range naming.
-const CPLX = 0x08                                 # NEW: "real欄に置けない"(√-1型) — 複素へ行け
 function Base.:^(a::TotNum, b::TotNum)
     x, y = a.val, b.val
     inflag = a.flag | b.flag
@@ -128,19 +144,98 @@ function Base.:^(a::TotNum, b::TotNum)
         end
     end
     if x < 0 && !isinteger(y)                     # (負)^(非整数) = 実数の範囲外 → 型が違う
-        return TotNum(0.0, inflag | CPLX)         # NaN でなく "複素へ" と名指し
+        # 底の符号が不明なら 真値が正=実結果もあり得る → 方向ビットを主張しない
+        return (a.flag & SUNK) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) :
+                                      TotNum(0.0, inflag | CPLX)
+    end
+    if x == 0 && y < 0                            # 0^負 = 1/(0^|y|) = 1/0 = 0 (全域規約と整合)
+        _sign_untrusted(a) || return TotNum(0.0, 0x00)      # 本物の0(や true=0 のLE) → 厳密に0
+        return TotNum(0.0, NOB | SUNK | (isinteger(y) ? 0x00 : CPLX))
     end
     # 負の底の 符号: 指数の 偶奇で 決まる。y が Int64 外(1e300 等)なら 実質 偶数扱いで 安全
     s = (x < 0 && abs(y) < 9e18 && isodd(round(Int, y))) ? -1.0 : 1.0
     r = _sat(s * abs(x)^y)                         # 溢れ→±MAX·GE / 潰れ→±MIN·LE を _sat が担当
-    TotNum(r.val, r.flag | inflag)
+    if b.flag != 0x00
+        return TotNum(r.val, r.flag | NOB | SUNK)  # 指数が不確か: 方向を主張できない
+    end
+    if !isinteger(y) && _sign_untrusted(a)
+        return TotNum(r.val, r.flag | NOB | SUNK | CPLX)   # 底が負かも×非整数冪 → 複素の可能性
+    end
+    TotNum(r.val, r.flag | _powflag(a.flag, y))
 end
-Base.:^(a::TotNum, n::Integer) = (r = _sat(a.val^n); TotNum(r.val, r.flag | a.flag))
-Base.literal_pow(::typeof(^), a::TotNum, ::Val{N}) where {N} = (r = _sat(a.val^N); TotNum(r.val, r.flag | a.flag))
-Base.exp(a::TotNum) = (r = _sat(exp(a.val)); TotNum(r.val, r.flag | a.flag))
-Base.log(a::TotNum) = (r = _sat(log(max(a.val, MINF))); TotNum(r.val, r.flag | a.flag))
-Base.sin(a::TotNum) = TotNum(sin(a.val), a.flag)   # bounded [-1,1]: no new range flag
-Base.cos(a::TotNum) = TotNum(cos(a.val), a.flag)
+# |result| = |x|^y is monotone in |x| ⇒ the |·|-bound direction survives — but y < 0 is a
+# reciprocal, so GE and LE SWAP (audit counterexample ⑤: (2,GE)^-1 claimed 0.5⟦≥⟧ while the
+# truth allows 4⁻¹ = 0.25 ≤ 0.5). Sign: even integer power ⇒ certain (+, SUNK dropped);
+# odd ⇒ follows the base (SUNK kept); non-integer with untrusted sign ⇒ possibly complex
+# ⇒ NOB|SUNK (the 3-bit vocabulary's honest floor).
+@inline function _powflag(fbase::UInt8, y::Float64)
+    dir = fbase & (GE | LE)
+    if y < 0
+        dir = dir == GE ? LE : (dir == LE ? GE : dir)
+    end
+    (fbase & SUNK) == 0x00 && return dir
+    if isinteger(y) && abs(y) < 9e18
+        return iseven(round(Int, y)) ? dir : (dir | SUNK)
+    end
+    NOB | SUNK
+end
+function Base.:^(a::TotNum, n::Integer)
+    n == 0 && return TotNum(1.0, 0x00)             # x^0 = 1 exact (0^0 = 1: 空の積)
+    if a.val == 0 && n < 0                          # 0^(−n) = 1/0 = 0 (Moore-Penrose と整合)
+        return a.flag == 0x00 ? TotNum(0.0, 0x00) : TotNum(0.0, NOB | SUNK)
+    end
+    r = _sat(a.val^n)
+    TotNum(r.val, r.flag | _powflag(a.flag, Float64(n)))
+end
+Base.literal_pow(::typeof(^), a::TotNum, ::Val{N}) where {N} = a^N
+function Base.exp(a::TotNum)
+    r = _sat(exp(a.val))
+    f = a.flag
+    f == 0x00 && return r
+    # exp > 0 always ⇒ output sign is CERTAIN (SUNK never propagates out); but the
+    # |·|-bound direction flips with the input's sign: |true|≥|val| with val<0 means
+    # true ≤ val ⇒ exp(true) ≤ exp(val) ⇒ LE, not GE. (audit counterexample ③)
+    (f & SUNK) != 0 && return TotNum(r.val, r.flag | NOB)
+    dir = f & (GE | LE)
+    dir == NOB && return TotNum(r.val, r.flag | NOB)
+    if a.val == 0
+        out = dir == LE ? 0x00 : NOB          # (0,LE) ⇒ true=0 ⇒ exact 1 ; (0,GE) ⇒ anything
+    elseif a.val > 0
+        out = dir                              # positive: monotone, direction survives
+    else
+        out = dir == GE ? LE : GE              # negative: direction flips
+    end
+    TotNum(r.val, r.flag | out)
+end
+function Base.log(a::TotNum)
+    if a.val < 0                                            # 実数範囲外: 複素へ
+        return (a.flag & SUNK) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) : TotNum(0.0, a.flag | CPLX)
+    end
+    if a.val == 0
+        # 本物の0: log0 = −∞ → −MAX+GE ; 危険な0(GE付き): 真値不明(負なら複素) → NOB|SUNK|CPLX
+        return (a.flag & GE) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) : TotNum(-MAXF, GE)
+    end
+    r = _sat(log(a.val))
+    f = a.flag
+    f == 0x00 && return r
+    (f & SUNK) != 0 && return TotNum(r.val, r.flag | NOB | SUNK | CPLX)  # 真値が負なら複素
+    dir = f & (GE | LE)
+    # log crosses sign at 1: the |·|-bound direction survives only when the admissible set
+    # stays on one side of 1 — provable in exactly two cells (audit principle):
+    out = if dir == GE && a.val > 1
+        GE                                     # true ≥ val > 1: log>0 grows → GE
+    elseif dir == LE && a.val < 1
+        GE                                     # 0 < true ≤ val < 1: |log| grows toward 0⁺ → GE
+    else
+        NOB | SUNK                             # admissible set may cross 1: sign+bound unknown
+    end
+    TotNum(r.val, r.flag | out)
+end
+# periodic: an input magnitude-bound says (almost) NOTHING about the output — the
+# admissible set can cross any number of periods (audit counterexample ④: sin(π/2,GE)
+# claimed +1⟦≥⟧ while the truth allows sin(3π/2) = −1). Flagged input ⇒ NOB|SUNK.
+Base.sin(a::TotNum) = a.flag == 0x00 ? TotNum(sin(a.val), 0x00) : TotNum(sin(a.val), NOB | SUNK)
+Base.cos(a::TotNum) = a.flag == 0x00 ? TotNum(cos(a.val), 0x00) : TotNum(cos(a.val), NOB | SUNK)
 Base.inv(a::TotNum) = one(TotNum) / a
 Base.:*(a::TotNum, b::Bool) = b ? a : zero(TotNum)   # solvers multiply by Bool masks
 Base.:*(b::Bool, a::TotNum) = b ? a : zero(TotNum)

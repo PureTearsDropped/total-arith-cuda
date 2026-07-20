@@ -29,10 +29,24 @@ event — the step and direction at which the run left representable range — f
 through the external library's internals. This is what `ScalarTot`'s `Number` interface buys
 that Python cannot.
 
-**The through-line.** `TotNum` (scalar) is the M = 1 case of `Hyper` (any M): a hypercomplex
-number is its left-multiplication matrix `L_x`, and every operation — product, power, exp,
-log, sqrt — is one recipe with M and the wiring table as the only knobs. Forward computation
-is uniformly total across all M; the single place anything breaks is *inversion*, and it
-breaks the same way everywhere (`L_x` singular). The flag is not "the algebra broke" — it is
-"you asked for an inverse that has no unique answer." (Scalars/complex/quaternion/octonion
-are division algebras and never hit it; zero divisors first appear at M = 16, the sedenions.)
+**The through-line.** `TotNum` (scalar) is the M = 1 case of `Hyper` (any M): function
+values are computed through the **left regular action** — `f(x) := f(L_x)·e₀`, where `L_x`
+is the left-multiplication matrix. Precision matters here: for non-associative M,
+`L_{xy} ≠ L_x·L_y` in general (measured: the defect is O(1) for sedenions), so this is NOT
+"everything is the same matrix algebra" — it is one *declared* recipe (left action), whose
+defining identities are then **checked per dimension** in the self-tests, and which reduces
+to the ordinary matrix-function calculus in the associative cases. Forward computation is
+uniformly total across all M; the single place anything breaks is *inversion*, and it breaks
+the same way everywhere (`L_x` singular). The flag is not "the algebra broke" — it is "you
+asked for an inverse that has no unique answer." (Scalars/complex/quaternion/octonion are
+division algebras and never hit it; zero divisors first appear at M = 16, the sedenions.)
+
+**Flag soundness** (`audit_flags.jl`): GE/LE are absolute-value bounds and do NOT commute
+with a function unless monotonicity on the admissible set is proven — a 2026-07-20 external
+audit found five transcendental flag lies in `ScalarTot` (sqrt(-1)→clean 0, log(-1)/log(0)
+silent finite, exp direction not flipped for negative inputs, sin/cos passing bounds through
+a period, negative powers not swapping GE↔LE). All fixed under one principle — *if monotone
++ sign-consistent cannot be proven on the admissible set, drop to GE|LE|SUNK (and CPLX when
+the true value may leave ℝ)* — and a permanent **semantic oracle** now enumerates admissible
+true values per flagged input and falsifies every output claim: `julia audit_flags.jl` →
+3039 checks, 0 violations.
