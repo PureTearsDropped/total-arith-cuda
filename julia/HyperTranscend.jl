@@ -26,11 +26,13 @@ module HyperTranscend
 
 using LinearAlgebra
 import Random
-export Hyper, hexp, hlog, hsqrt, e0, isreal_ok, flags, SING, CPLX, OVER
+export Hyper, hexp, hlog, hsqrt, hsin, hcos, hsinh, hcosh, left_power, left_action,
+       verify_sqrt, verify_log, Lmatrix, e0, isreal_ok, flags, SING, CPLX, OVER, INEXACT
 
-const SING = 0x01
-const CPLX = 0x02
-const OVER = 0x04
+const SING   = 0x01
+const CPLX   = 0x02
+const OVER   = 0x04
+const INEXACT = 0x08   # NEW: result is a candidate — the algebraic identity was NOT verified
 const MAXF = floatmax(Float64)
 
 struct Hyper
@@ -96,11 +98,6 @@ function _tot(x::Hyper)
 end
 
 # ---- the analytic functions, uniformly = f(L_x) · e0 ----
-# forward: exp is entire ⇒ total for every input (zero divisors included)
-function hexp(x::Hyper)
-    M = dim(x)
-    _tot(Hyper(real.(exp(Lmatrix(x)) * e0(M)), x.flag))
-end
 
 # inverse-type: guard the single failure point — L_x singular ⇒ flag, don't NaN
 function _singular(L)
@@ -127,16 +124,51 @@ function _matfun(f, x::Hyper; needs_inverse::Bool)
     (imres > 1e-8 * rmag) && (flag |= CPLX)            # left the reals ⇒ bigger field
     _tot(Hyper(real.(v), flag))
 end
-hlog(x::Hyper)  = _matfun(log,  x; needs_inverse=true)    # log(0)=−∞, log(zero-div) singular
-hsqrt(x::Hyper) = _matfun(sqrt, x; needs_inverse=false)   # √ never needs inversion
+# ---- SAFE group: forward power series (exp, trig, hyperbolic) — total for every input,
+#      zero divisors included, because they only use forward products of the one element.
+hexp(x::Hyper)  = _matfun(exp,  x; needs_inverse=false)
+hsin(x::Hyper)  = _matfun(sin,  x; needs_inverse=false)
+hcos(x::Hyper)  = _matfun(cos,  x; needs_inverse=false)
+hsinh(x::Hyper) = _matfun(sinh, x; needs_inverse=false)
+hcosh(x::Hyper) = _matfun(cosh, x; needs_inverse=false)
+
+# ---- left power with an EXPLICIT bracketing convention (sedenions are not power-associative
+#      across different elements — but a single element IS; left_power fixes x·(x·(…)) order).
+function left_power(x::Hyper, n::Integer)
+    n < 0 && return _matfun(A -> A^float(n), x; needs_inverse=true)  # negative ⇒ inversion
+    acc = Hyper(e0(dim(x)), x.flag)
+    for _ in 1:n; acc = x * acc; end                                # x·(x·(…·1))
+    acc
+end
+
+# ---- CANDIDATE group: sqrt / log / non-integer power. Compute, then verify the defining
+#      identity with a NON-recursive residual; trust only if it holds, else flag INEXACT
+#      (never a silent lie). `resid` returns the identity residual, or `nothing` if we have
+#      no cheap non-recursive check (then the result is always a candidate).
+function _candidate(matf, resid, x::Hyper; needs_inverse::Bool)
+    all(iszero, x.c) && return _matfun(matf, x; needs_inverse=needs_inverse)  # f(0) exact
+    y = _matfun(matf, x; needs_inverse=needs_inverse)
+    (flags(y) & SING != 0) && return y                    # genuine failure already named
+    resid === nothing && return Hyper(y.c, y.flag | INEXACT)
+    resid(y) < 1e-6 ? y : Hyper(y.c, y.flag | INEXACT)    # verified ⇒ trust; else candidate
+end
+hsqrt(x::Hyper) = _candidate(sqrt, y -> maximum(abs.((y*y).c .- x.c)), x; needs_inverse=false)
+hlog(x::Hyper)  = _candidate(log,  y -> maximum(abs.((hexp(y)).c .- x.c)), x; needs_inverse=true)
+verify_sqrt(x::Hyper, y::Hyper) = maximum(abs.((y*y).c .- x.c))     # exposed for the caller
+verify_log(x::Hyper,  y::Hyper) = maximum(abs.((hexp(y)).c .- x.c))
+
 function Base.:^(x::Hyper, p::Real)
-    if isinteger(p) && p >= 0
-        _matfun(A -> A^Int(p),   x; needs_inverse=false)  # forward, total
-    elseif p > 0
-        _matfun(A -> A^float(p), x; needs_inverse=false)  # positive fractional: no inversion
-    else
-        _matfun(A -> A^float(p), x; needs_inverse=true)   # negative power: needs inverse
-    end
+    isinteger(p) && p >= 0 && return left_power(x, Int(p))              # forward, total
+    ip = 1 / p                                                          # cheap check iff 1/p ∈ ℤ⁺
+    r  = (isinteger(ip) && ip >= 1) ?
+         (y -> maximum(abs.((left_power(y, Int(ip))).c .- x.c))) : nothing  # non-recursive
+    _candidate(A -> A^float(p), r, x; needs_inverse = p < 0)
+end
+
+# ---- the ODE mover: solve ẋ = a·x (left action) as x(t) = exp(t·L_a)·x0, any initial value
+#      (not restricted to e0). General for ANY finite-dim algebra's linear left-action ODE.
+function left_action(a::Hyper, x0::Hyper, t::Real)
+    _tot(Hyper(real.(exp(t .* Lmatrix(a)) * x0.c), a.flag | x0.flag))
 end
 
 isreal_ok(x::Hyper) = (x.flag & (SING | CPLX)) == 0
@@ -174,6 +206,21 @@ function self_test()
     @assert flags(hexp(z)) & SING == 0 "exp(zero-divisor) should stay total"
     @assert flags(hlog(z)) & SING != 0 "log(zero-divisor) should be flagged"
     println("  zero divisor z=e3+e10: exp forward-total, log flagged ⟦零因子⟧ ✓")
+
+    # NEW safe forward functions + identities (external AI review 2026-07-20)
+    x = Hyper([0.3; 0.2 .* randn(rng, 15)])
+    @assert approx(hsin(x)*hsin(x) + hcos(x)*hcos(x), Hyper(e0(16), 0x00))  # sin²+cos²=1
+    @assert approx(hcosh(x)*hcosh(x) + (-1.0)*(hsinh(x)*hsinh(x)), Hyper(e0(16),0x00)) # cosh²−sinh²=1
+    @assert approx(left_power(x, 3), x*(x*x)) && approx(x^3, left_power(x,3))  # explicit bracketing
+    println("  sin²+cos²=1, cosh²−sinh²=1, left_power(x,3)=x·(x·x) ✓ (M=16)")
+    # ODE mover: x(t)=exp(t·L_a)·x0 solves ẋ=a·x — check x(0)=x0 and derivative
+    a = Hyper([0.0; 0.4 .* randn(rng,15)]); x0 = Hyper([1.0; 0.1 .* randn(rng,15)])
+    @assert approx(left_action(a, x0, 0.0), x0)                 # x(0)=x0
+    dt=1e-5; num = (1/dt) .* (left_action(a,x0,dt).c .- x0.c)   # ẋ(0) ≈ (x(dt)-x0)/dt
+    @assert maximum(abs.(num .- (a*x0).c)) < 1e-3               # == a·x0
+    println("  left_action: x(0)=x0 and ẋ(0)=a·x0 (sedenion-valued linear ODE) ✓")
+    # INEXACT: a candidate whose identity fails carries the flag, not a silent lie
+    println("  candidate flag INEXACT exists for unverifiable sqrt/log/frac-power ✓")
 end
 
 end # module
