@@ -34,6 +34,7 @@ module NestedSeries
 export Alg, cd_alg, cyclic_alg, matn_alg, mat_over, tensor, jordan, lie, commutator,
        Nel, nel, coeffs, flagof, tmul, tadd,
        TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog, ninv,
+       OPS, nop, list_ops, binom_tape,
        assoc_defect, powerassoc_defect, commut_defect, SING, OVER, INEXACT
 
 const SING    = 0x01
@@ -254,6 +255,63 @@ function ninv(A::Alg, x::Nel; order::Int = 60)
     resid < 1e-6 ? (y, resid) : (Nel(y.c, y.flag | INEXACT), resid)
 end
 
+# ================================================================ operator presets
+"binomial tape for (1+u)^p — the coefficient c_k = C(p,k), built iteratively"
+binom_tape(p) = k -> begin
+    c = 1.0
+    for i in 1:k; c *= (p - i + 1) / i; end
+    c
+end
+
+"""OPS — the operator preset shelf.  Each entry is one operation as data:
+     kind    :forward (safe for every input) | :candidate (verified, else INEXACT)
+     tape    the coefficient series (the O layer)
+     shift   false: series in x | true: series in u = x − 1 (log/inv/roots live near 1)
+     verify  for candidates: (A, x, y) -> residual of the DEFINING identity, brackets
+             declared inside (e.g. cbrt checks (y·y)·y).
+   Adding an operation = adding one entry.  `nop(A, name, x)` runs any of them on any Alg."""
+const OPS = Dict{Symbol,NamedTuple}(
+    :exp   => (kind = :forward,   tape = TAPES[:exp],  shift = false, order = 20, verify = nothing),
+    :sin   => (kind = :forward,   tape = TAPES[:sin],  shift = false, order = 21, verify = nothing),
+    :cos   => (kind = :forward,   tape = TAPES[:cos],  shift = false, order = 20, verify = nothing),
+    :sinh  => (kind = :forward,   tape = TAPES[:sinh], shift = false, order = 21, verify = nothing),
+    :cosh  => (kind = :forward,   tape = TAPES[:cosh], shift = false, order = 20, verify = nothing),
+    :atan  => (kind = :forward,   tape = k -> isodd(k) ? (-1.0)^((k - 1) ÷ 2) / k : 0.0,
+               shift = false, order = 41, verify = nothing),
+    :log   => (kind = :candidate, tape = k -> k == 0 ? 0.0 : (-1.0)^(k + 1) / k,
+               shift = true, order = 30,
+               verify = (A, x, y) -> maximum(abs.(coeffs(nexp(A, y)) .- x.c))),
+    :inv   => (kind = :candidate, tape = k -> (-1.0)^k, shift = true, order = 60,
+               # Σ(x−1)^k(−1)^k = Σ(1−x)^k — the geometric series, in shift bookkeeping
+               verify = (A, x, y) -> max(maximum(abs.(coeffs(tmul(A, x, y)) .- A.unit)),
+                                         maximum(abs.(coeffs(tmul(A, y, x)) .- A.unit)))),
+    :sqrt  => (kind = :candidate, tape = binom_tape(0.5), shift = true, order = 40,
+               verify = (A, x, y) -> maximum(abs.(coeffs(tmul(A, y, y)) .- x.c))),
+    :cbrt  => (kind = :candidate, tape = binom_tape(1 / 3), shift = true, order = 40,
+               verify = (A, x, y) -> maximum(abs.(coeffs(tmul(A, tmul(A, y, y), y)) .- x.c))),
+)
+"""run a preset by name on any Alg: `nop(A, :sqrt, x)`.  Forward presets are total for
+   every input; candidates verify their defining identity and flag INEXACT on failure —
+   same honesty for every operator, uniformly."""
+function nop(A::Alg, name::Symbol, x::Nel; order::Union{Int,Nothing} = nothing,
+             bracket::Symbol = :left)
+    op = OPS[name]
+    ord = order === nothing ? op.order : order
+    arg = op.shift ? tadd(x, tscale(nel(A), -1.0)) : x
+    y = series(A, arg, op.tape; order = ord, bracket)
+    op.kind === :forward && return y
+    resid = op.verify(A, x, y)
+    resid < 1e-6 ? y : Nel(y.c, y.flag | INEXACT)
+end
+
+"print the preset shelf: name, kind, and what the candidate verification checks"
+function list_ops()
+    for (nm, op) in sort(collect(OPS); by = first)
+        println(rpad(string(nm), 7), op.kind === :forward ? "forward (total, no flag needed)" :
+                "candidate (verified vs defining identity, else INEXACT)")
+    end
+end
+
 # ================================================================ measure, don't assume
 "max |(xy)z − x(yz)| over random triples — the associativity of the COMPOSED algebra"
 function assoc_defect(A::Alg; trials::Int = 4, rng = nothing)
@@ -415,6 +473,26 @@ function self_test()
     println("BCH gate: cd4 ", round(ratios[4], sigdigits = 3), " / cd8 ",
             round(ratios[8], sigdigits = 3), " ≈ s⁴ repaired (Artin measured) ; cd16 ",
             round(ratios[16], sigdigits = 3), " ≈ s³ structural break ✓")
+    # operator preset shelf: one gateway, uniform honesty
+    Ap = cd_alg(16); gp = _lcg()
+    xp = Nel(0.3 .* rand_vec(gp, 16), 0x00)
+    for (nm, f) in ((:exp, nexp), (:sin, nsin), (:cos, ncos), (:sinh, nsinh), (:cosh, ncosh))
+        @assert maximum(abs.(coeffs(nop(Ap, nm, xp)) .- coeffs(f(Ap, xp)))) < 1e-12
+    end
+    xn = tadd(nel(Ap), tscale(xp, 0.5))                       # near 1: roots/log/inv converge
+    ys = nop(Ap, :sqrt, xn)
+    @assert (flagof(ys) & INEXACT) == 0
+    @assert maximum(abs.(coeffs(tmul(Ap, ys, ys)) .- xn.c)) < 1e-6
+    yc = nop(Ap, :cbrt, xn)
+    @assert (flagof(yc) & INEXACT) == 0                       # (y·y)·y bracket declared in verify
+    A1 = cd_alg(1)                                            # reals: atan preset vs Base.atan
+    @assert abs(coeffs(nop(A1, :atan, nel(A1, [0.5])))[1] - atan(0.5)) < 1e-9
+    zsq = nop(mat_over(cd_alg(16), 2), :sqrt,
+              tadd(nel(mat_over(cd_alg(16), 2)),
+                   tscale(Nel(0.2 .* rand_vec(gp, 64), 0x00), 0.5)))
+    println("preset shelf: exp/sin/cos/sinh/cosh ≡ named fns ✓ ; √,∛ verified on cd16 ✓ ; ",
+            "atan(0.5) matches ℝ ✓ ; √ on mat2⟨cd16⟩ (no pow-assoc): ",
+            (flagof(zsq) & INEXACT) == 0 ? "verifies (2-factor identity!)" : "INEXACT (measured)")
     # tape user-extensibility: a custom tape (Bessel-ish) runs on any Alg unchanged
     j0 = series(cd_alg(4), Nel(0.3 .* rand_vec(g, 4), 0x00),
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
