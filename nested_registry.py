@@ -277,6 +277,78 @@ ALGS = {
 }
 def alg(name): return ALGS[name]()
 
+# ================================================================ UVW: the algorithm shelf
+class Impl:
+    """ONE bilinear algorithm in (U,V,W) normal form: c = Wᵀ((U·a) ⊙ (V·b)).
+       R = U.shape[0] = number of scalar multiplications — the hardware cost.
+       Correctness is a TENSOR EQUATION: Σ_r U[r,i]V[r,j]W[r,k] must equal the target
+       algebra's T[i,j,k] — verified numerically, never assumed."""
+    __slots__ = ("name", "U", "V", "W")
+    def __init__(self, name, U, V, W):
+        self.name = name
+        self.U, self.V, self.W = (np.asarray(m, float) for m in (U, V, W))
+    @property
+    def R(self): return self.U.shape[0]
+    def __repr__(self): return f"{self.name}(R={self.R})"
+
+def impl_tensor(im): return np.einsum("ri,rj,rk->ijk", im.U, im.V, im.W)
+def impl_verify(im, A):
+    "0.0 ⟺ this algorithm computes exactly this algebra's product"
+    return float(np.max(np.abs(impl_tensor(im) - A.T)))
+def impl_mul(im, x, y):
+    "run a product THROUGH the algorithm: R scalar multiplications, then wiring"
+    return im.W.T @ ((im.U @ x) * (im.V @ y))
+
+def naive_impl(A):
+    "the trivial decomposition read off T: one multiplication per nonzero (i,j) pair"
+    rows = [(i, j) for i in range(A.dim) for j in range(A.dim) if np.any(A.T[i, j])]
+    U = np.zeros((len(rows), A.dim)); V = np.zeros((len(rows), A.dim)); W = np.zeros((len(rows), A.dim))
+    for r, (i, j) in enumerate(rows):
+        U[r, i] = 1.0; V[r, j] = 1.0; W[r] = A.T[i, j]
+    return Impl(f"naive⟨{A.name}⟩", U, V, W)
+
+def impl_kron(a, b):
+    """algorithms COMPOSE like algebras do: the Kronecker product of two (U,V,W)s computes
+       the tensor-product algebra, with R = R_a·R_b — the UVW mirror of tensor(A,B)."""
+    return Impl(f"{a.name}⊗{b.name}", np.kron(a.U, b.U), np.kron(a.V, b.V), np.kron(a.W, b.W))
+
+def _gauss_cd2():
+    "complex multiply in 3 real multiplications (Gauss/Karatsuba) instead of 4"
+    return Impl("gauss⟨cd2⟩", U=[[1, 0], [0, 1], [1, 1]], V=[[1, 0], [0, 1], [1, 1]],
+                W=[[1, -1], [-1, -1], [0, 1]])
+
+def _strassen_mat2():
+    "Strassen: 2×2 matrix multiply in 7 multiplications instead of 8 (row-major A11..A22)"
+    U = [[1, 0, 0, 1], [0, 0, 1, 1], [1, 0, 0, 0], [0, 0, 0, 1],
+         [1, 1, 0, 0], [-1, 0, 1, 0], [0, 1, 0, -1]]
+    V = [[1, 0, 0, 1], [1, 0, 0, 0], [0, 1, 0, -1], [-1, 0, 1, 0],
+         [0, 0, 0, 1], [1, 1, 0, 0], [0, 0, 1, 1]]
+    W = [[1, 0, 0, 1], [0, 0, 1, -1], [0, 1, 0, 1], [1, 0, 1, 0],
+         [-1, 1, 0, 0], [0, 0, 0, 1], [1, 0, 0, 0]]
+    return Impl("strassen⟨mat2⟩", U, V, W)
+
+IMPLS = {
+    "complex_naive":    lambda: naive_impl(cd_alg(2)),          # R=4
+    "complex_gauss":    _gauss_cd2,                             # R=3
+    "quaternion_naive": lambda: naive_impl(cd_alg(4)),          # R=16
+    "sedenion_naive":   lambda: naive_impl(cd_alg(16)),         # R=256
+    "mat2_naive":       lambda: naive_impl(matn_alg(2)),        # R=8
+    "mat2_strassen":    _strassen_mat2,                         # R=7
+    "gauss2":           lambda: impl_kron(_gauss_cd2(), _gauss_cd2()),  # cd2⊗cd2, R=9<16
+}
+def impl(name): return IMPLS[name]()
+
+def list_impls():
+    "the shelf with each algorithm's measured badge: target algebra, R, and exactness"
+    targets = {"complex_naive": cd_alg(2), "complex_gauss": cd_alg(2),
+               "quaternion_naive": cd_alg(4), "sedenion_naive": cd_alg(16),
+               "mat2_naive": matn_alg(2), "mat2_strassen": matn_alg(2),
+               "gauss2": tensor(cd_alg(2), cd_alg(2))}
+    print(f"{'preset':<18}{'computes':<12}{'R(乗算)':<10}exact?")
+    for nm in sorted(IMPLS):
+        im, tg = IMPLS[nm](), targets[nm]
+        print(f"{nm:<18}{tg.name:<12}{im.R:<10}{'✓ 0.0' if impl_verify(im, tg) < 1e-12 else '✗'}")
+
 # ================================================================ probes: measure, don't assume
 def _rand(rng, n, s=0.3): return Nel(s * rng.standard_normal(n))
 
@@ -399,6 +471,20 @@ def self_test():
     xg = nel(G2, [0.0, 0.7, 0.4, 0.0])
     assert float(np.max(np.abs(nexp(G2, xg, order=3).c - nexp(G2, xg, order=30).c))) < 1e-15
     print(f"dualquat: associative, exp∘log {rq:.1e} ✓ ; Λ2: exp terminates (order 3 ≡ 30) ✓")
+    # UVW algorithm shelf: same T, different (U,V,W) — HOW is swappable, WHAT is verified
+    print("--- IMPLS shelf (algorithms; exactness = tensor equation, measured) ---")
+    list_impls()
+    for nm, A in (("complex_gauss", cd_alg(2)), ("mat2_strassen", matn_alg(2)),
+                  ("sedenion_naive", cd_alg(16))):
+        im = impl(nm)
+        assert impl_verify(im, A) < 1e-12                     # ΣUVW ≡ T exactly
+        xa, xb = rng.standard_normal(A.dim), rng.standard_normal(A.dim)
+        assert float(np.max(np.abs(impl_mul(im, xa, xb) - rawmul(A, xa, xb)))) < 1e-12
+    g2 = impl("gauss2")                                       # algorithms compose like algebras
+    assert impl_verify(g2, tensor(cd_alg(2), cd_alg(2))) < 1e-12 and g2.R == 9
+    print(f"kron composition: gauss⊗gauss computes cd2⊗cd2 exactly with R=9 (naive 16) ✓")
+    print(f"cost of exp on cd2 (order 20 = 20 products): naive {20 * impl('complex_naive').R}"
+          f" mults vs gauss {20 * impl('complex_gauss').R} mults — same answer, verified same T")
     # totality
     bad = nel(cd_alg(16), [np.nan] + [1e308] * 15)
     assert (bad.flag & SING) and np.isfinite(nexp(cd_alg(16), bad).c).all()
