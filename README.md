@@ -140,6 +140,19 @@ python hyper_transcend.py            # per-dimension identity self-test (M = 1..
 python hyper_transcend.py --audit    # adversarial totality audit → NaN/Inf 0, exceptions 0, false-flags 0
 ```
 
+### `total_pipeline.py` — U → V(O,N,M) → W, named
+
+External review observed that `cuda_total.py` already runs as U (entry totalization) →
+V (fused float64 MAC) → W (saturate-once + pattern-rule flags), with N (the wiring tensor)
+swappable and M implicit (the einsum applies `L_a` without materializing it) — "already that
+architecture, just unnamed." This module gives it the names and the common interface
+**without touching the five-round-audited core**: `apply(op, a, b, algebra=…)` is the one
+gateway (asserted bit-identical to direct kernel calls), `Algebra.from_kind/.from_registry`
+fills the N slot — the second **bridges the entire ALGS shelf** (dual quaternions, Clifford,
+Grassmann, …) onto the audited kernel, flags included — `Lmatrix` exposes the explicit M for
+verification (implicit ≡ explicit asserted), and `Pipeline('gmul', algebra)` is the
+declarative composition. `python total_pipeline.py` runs the five-way self-test.
+
 ### `nested_series.py` / `nested_registry.py` — nesting and the twin shelves
 
 `nested_series.py`: the original three-layer experiment (matrix ⊃ sedenion ⊃ digit) —
