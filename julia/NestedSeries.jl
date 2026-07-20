@@ -31,7 +31,7 @@ nested_series.py, generalized).
 """
 module NestedSeries
 
-export Alg, cd_alg, cyclic_alg, matn_alg, mat_over, tensor, jordan,
+export Alg, cd_alg, cyclic_alg, matn_alg, mat_over, tensor, jordan, lie, commutator,
        Nel, nel, coeffs, flagof, tmul, tadd,
        TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog, ninv,
        assoc_defect, powerassoc_defect, commut_defect, SING, OVER, INEXACT
@@ -157,6 +157,22 @@ function jordan(A::Alg)
     _from_mul("sym⟨$(A.name)⟩", A.dim, copy(A.unit),
               (x, y) -> (rawmul(A, x, y) .+ rawmul(A, y, x)) ./ 2)
 end
+
+"""antisymmetrized product ½[a,b] = (ab−ba)/2 — jordan's sibling: the ORDER-ONLY half.
+   Every product splits EXACTLY as  ab = a∘b + ½[a,b]  (order-forgetting + order-carrying);
+   commutativity is precisely "the lie half vanishes".  Measured ladder of what the
+   commutator machinery can repair (see self_test):
+     · 2-variable BCH  exp(a)exp(b) = exp(a+b+½[a,b]+1/12[a,[a,b]]+1/12[b,[b,a]]+…)
+       repairs at s⁴-scaling up to the OCTONIONS (Artin: any 2-generated subalgebra is
+       associative) and breaks to s³ at the sedenions (alternativity lost).
+     · 3-variable Jacobi [[a,b],c]+[[b,c],a]+[[c,a],b]=0 breaks already at the octonions
+       (the commutator algebra is Malcev, not Lie)."""
+function lie(A::Alg)
+    _from_mul("lie⟨$(A.name)⟩", A.dim, zeros(A.dim),        # no unit: [1,x]=0 kills it
+              (x, y) -> (rawmul(A, x, y) .- rawmul(A, y, x)) ./ 2)
+end
+"the commutator [a,b] = ab − ba on Nel — the order information itself"
+commutator(A::Alg, x, y) = tadd(tmul(A, x, y), tscale(tmul(A, y, x), -1.0))
 
 "element of an Alg: coefficients + flag; totalized at every step (never NaN/Inf)"
 struct Nel
@@ -359,6 +375,46 @@ function self_test()
     end
     println("tensor law: ⊗-partner must be commutative AND associative to preserve",
             " power-associativity (jordan pincer: commutative alone fails) ✓")
+    # order machinery: exact split ab = a∘b + ½[a,b]; Jacobi and BCH gates measured
+    for M in (4, 16)
+        Ao = cd_alg(M); go = _lcg()
+        a = Nel(0.4 .* rand_vec(go, M), 0x00); b = Nel(0.4 .* rand_vec(go, M), 0x00)
+        Aj = jordan(Ao); Al = lie(Ao)
+        recon = tadd(_tot(rawmul(Aj, a.c, b.c), 0x00), _tot(rawmul(Al, a.c, b.c), 0x00))
+        @assert maximum(abs.(recon.c .- tmul(Ao, a, b).c)) < 1e-12
+    end
+    jac(A, x, y, z) = tadd(tadd(commutator(A, commutator(A, x, y), z),
+                                commutator(A, commutator(A, y, z), x)),
+                           commutator(A, commutator(A, z, x), y))
+    jd = Dict{Int,Float64}()
+    for M in (4, 8, 16)
+        Ao = cd_alg(M); go = _lcg()
+        x, y, z = (Nel(0.4 .* rand_vec(go, M), 0x00) for _ in 1:3)
+        jd[M] = maximum(abs.(jac(Ao, x, y, z).c))
+    end
+    @assert jd[4] < 1e-12 && jd[8] > 1e-3 && jd[16] > 1e-3
+    println("order split ab = a∘b + ½[a,b] exact ✓ ; Jacobi: cd4 ✓ Lie, cd8/cd16 ✗ (Malcev)")
+    # BCH repair gate by scaling exponent: s⁴ (repaired) through octonions — Artin's
+    # theorem measured — s³ (structural) at sedenions
+    ratios = Dict{Int,Float64}()
+    for M in (4, 8, 16)
+        Ao = cd_alg(M); go = _lcg()
+        ba = rand_vec(go, M); bb = rand_vec(go, M)
+        r = Float64[]
+        for s in (0.2, 0.1)
+            a = Nel(s .* ba, 0x00); b = Nel(s .* bb, 0x00)
+            lhs = tmul(Ao, nexp(Ao, a), nexp(Ao, b))
+            zc = tadd(tadd(a, b), tscale(commutator(Ao, a, b), 0.5))
+            zc = tadd(zc, tadd(tscale(commutator(Ao, a, commutator(Ao, a, b)), 1 / 12),
+                               tscale(commutator(Ao, b, commutator(Ao, b, a)), 1 / 12)))
+            push!(r, maximum(abs.(coeffs(lhs) .- coeffs(nexp(Ao, zc)))))
+        end
+        ratios[M] = r[1] / r[2]
+    end
+    @assert ratios[4] > 12 && ratios[8] > 12 && ratios[16] < 10
+    println("BCH gate: cd4 ", round(ratios[4], sigdigits = 3), " / cd8 ",
+            round(ratios[8], sigdigits = 3), " ≈ s⁴ repaired (Artin measured) ; cd16 ",
+            round(ratios[16], sigdigits = 3), " ≈ s³ structural break ✓")
     # tape user-extensibility: a custom tape (Bessel-ish) runs on any Alg unchanged
     j0 = series(cd_alg(4), Nel(0.3 .* rand_vec(g, 4), 0x00),
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
