@@ -144,6 +144,16 @@ Base.:*(b::Bool, a::TotNum) = b ? a : zero(TotNum)
 Base.nextfloat(a::TotNum) = TotNum(nextfloat(a.val), a.flag)
 Base.prevfloat(a::TotNum) = TotNum(prevfloat(a.val), a.flag)
 Base.eps(::Type{TotNum}) = TotNum(eps(Float64), 0x00)
+Base.eps(a::TotNum) = TotNum(eps(a.val), 0x00)         # 適応刻みが 値に対して呼ぶ
+Base.oneunit(::Type{TotNum}) = one(TotNum)
+Base.abs2(a::TotNum) = a * a                           # ソルバの ノルムが 使う
+Base.isapprox(a::TotNum, b::TotNum; kw...) = isapprox(a.val, b.val; kw...)
+Base.max(a::TotNum, b::TotNum) = a.val >= b.val ? a : b
+Base.min(a::TotNum, b::TotNum) = a.val <= b.val ? a : b
+Base.round(a::TotNum) = TotNum(round(a.val), a.flag)
+Base.:*(a::TotNum, b::Integer) = a * TotNum(b)
+Base.:/(a::TotNum, b::Integer) = a / TotNum(b)
+Base.:^(a::TotNum, b::AbstractFloat) = a ^ TotNum(b)
 Base.typemax(::Type{TotNum}) = TotNum(MAXF, GE)
 Base.typemin(::Type{TotNum}) = TotNum(-MAXF, GE)
 Base.isnan(::TotNum) = false                     # never — by construction
