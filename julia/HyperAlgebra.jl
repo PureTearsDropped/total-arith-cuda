@@ -14,7 +14,7 @@ TotalArith.jl — total arithmetic + swappable wiring (structure tensor), Julia 
   Semantics mirror cuda_total.py exactly (same flag algebra, same honest caveat: flags mark
   totalization events only; Float32 nearest rounding is not flagged — it has no direction).
 """
-module TotalArith
+module HyperAlgebra
 
 import Random
 
@@ -458,5 +458,5 @@ end
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    TotalArith.self_test()
+    HyperAlgebra.self_test()
 end

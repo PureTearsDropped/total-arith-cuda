@@ -127,24 +127,24 @@ rows (matrix-vector wirings produce them; hypercomplex ones never do), now fixed
 
 ### Julia — `julia/` (three modules, see `julia/README.md`)
 
-- **`TotalArith.jl`** — the port of this library: array/batch total arithmetic + swappable
-  wiring tensor, `CuArray`-ready (below).
-- **`TotArith.jl`** — total arithmetic as a Julia `Number` (`TotNum <: Real`): overloads the
+- **`HyperAlgebra.jl`** (basic algebra) — array/batch total arithmetic + swappable wiring
+  tensor (`group_mul`), `CuArray`-ready (below).
+- **`ScalarTot.jl`** (scalar) — total arithmetic as a Julia `Number` (`TotNum <: Real`): overloads the
   operators so **existing generic code runs on it unchanged** — an ODE solver from
   OrdinaryDiffEq.jl integrates with `TotNum` and the flag names *where/which-way* the run
   left the representable range (the "used, not demo" bridge that Julia's multiple dispatch
   makes possible and Python cannot).
-- **`HyperTot.jl`** — `exp`/`log`/`√`/`^` for a hypercomplex number of **any** M = 2^k, all as
+- **`HyperTranscend.jl`** (transcendental) — `exp`/`log`/`√`/`^` for a hypercomplex number of **any** M = 2^k, all as
   `f(x) = f(Lₓ)·e₀` (matrix function of the regular representation). Forward ops are total for
   every input incl. zero divisors; only inversion breaks — where `Lₓ` is singular — and there
   it names the value (`⟦zero-divisor⟧`) instead of `NaN`. The scalar `TotNum` is the M = 1 case.
 
-The port below is `julia/TotalArith.jl`: written against `AbstractArray` with only broadcasts
+The port below is `julia/HyperAlgebra.jl`: written against `AbstractArray` with only broadcasts
 + matmul, so the same functions run on `Array` (CPU) and are **CuArray-ready** (CUDA.jl) —
 Julia's multiple dispatch gives the CPU/GPU "backend swap" for free.
 
 ```bash
-julia julia/TotalArith.jl     # self-test, no packages needed (stdlib only)
+julia julia/HyperAlgebra.jl     # self-test, no packages needed (stdlib only)
 ```
 
 Measured here (Julia 1.11.5, CPU):

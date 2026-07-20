@@ -19,7 +19,7 @@ uniformly through the structure tensor and the regular representation.
                       CPLX = result left the reals (imag residue) ⇒ go to a bigger field;
                       OVER = a component saturated to ±MAX (range overflow).
 """
-module HyperTot
+module HyperTranscend
 
 using LinearAlgebra
 export Hyper, hexp, hlog, hsqrt, e0, isreal_ok, flags, SING, CPLX, OVER
