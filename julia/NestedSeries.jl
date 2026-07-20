@@ -31,10 +31,10 @@ nested_series.py, generalized).
 """
 module NestedSeries
 
-export Alg, cd_alg, cyclic_alg, matn_alg, mat_over, tensor,
+export Alg, cd_alg, cyclic_alg, matn_alg, mat_over, tensor, jordan,
        Nel, nel, coeffs, flagof, tmul, tadd,
-       TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog,
-       assoc_defect, SING, OVER, INEXACT
+       TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog, ninv,
+       assoc_defect, powerassoc_defect, commut_defect, SING, OVER, INEXACT
 
 const SING    = 0x01
 const OVER    = 0x04
@@ -148,6 +148,16 @@ function tensor(A::Alg, B::Alg)
 end
 
 # ================================================================ total elements + ops
+"""symmetrized (Jordan) product a∘b = (ab+ba)/2 — commutative by construction, but
+   associativity is generally LOST (measure it). This is the 'symmetrized exp' member
+   of the exp family made into a combinator. Measured role: a commutative-but-non-
+   associative tensor partner does NOT preserve power-associativity — commutativity
+   alone is not enough, the partner must be commutative AND associative."""
+function jordan(A::Alg)
+    _from_mul("sym⟨$(A.name)⟩", A.dim, copy(A.unit),
+              (x, y) -> (rawmul(A, x, y) .+ rawmul(A, y, x)) ./ 2)
+end
+
 "element of an Alg: coefficients + flag; totalized at every step (never NaN/Inf)"
 struct Nel
     c::Vector{Float64}
@@ -214,6 +224,20 @@ function nlog(A::Alg, x::Nel; order::Int = 30, verify_order::Int = 20)
     resid < 1e-6 ? (y, resid) : (Nel(y.c, y.flag | INEXACT), resid)
 end
 
+"""1/x WITHOUT a divider: the all-ones tape Σ u^k = (1−u)⁻¹ with u = 1 − x (converges for
+   ‖u‖ < 1), verified TWO-SIDED (x·y ≈ 1 AND y·x ≈ 1 — left and right inverse can differ
+   in a non-commutative algebra, so both are checked).  Inverse ⇒ candidate: a zero divisor
+   (or any x outside the basin) fails verification and is flagged INEXACT — the series
+   diverges honestly instead of returning a lie.  This is division rebuilt from the same
+   cells as everything else: one more coefficient tape on the one skeleton."""
+function ninv(A::Alg, x::Nel; order::Int = 60)
+    u = tadd(nel(A), tscale(x, -1.0))
+    y = series(A, u, k -> 1.0; order)
+    resid = max(maximum(abs.(coeffs(tmul(A, x, y)) .- A.unit)),
+                maximum(abs.(coeffs(tmul(A, y, x)) .- A.unit)))
+    resid < 1e-6 ? (y, resid) : (Nel(y.c, y.flag | INEXACT), resid)
+end
+
 # ================================================================ measure, don't assume
 "max |(xy)z − x(yz)| over random triples — the associativity of the COMPOSED algebra"
 function assoc_defect(A::Alg; trials::Int = 4, rng = nothing)
@@ -240,6 +264,17 @@ function powerassoc_defect(A::Alg; trials::Int = 4, rng = nothing)
     end
     worst
 end
+"max |xy − yx| — commutativity of the composed algebra (the third probe)"
+function commut_defect(A::Alg; trials::Int = 4, rng = nothing)
+    rnd = rng === nothing ? _lcg() : rng
+    worst = 0.0
+    for _ in 1:trials
+        x, y = (Nel(0.3 .* rand_vec(rnd, A.dim), 0x00) for _ in 1:2)
+        worst = max(worst, maximum(abs.(tmul(A, x, y).c .- tmul(A, y, x).c)))
+    end
+    worst
+end
+
 mutable struct _LCG; s::UInt64; end
 _lcg() = _LCG(0x9E3779B97F4A7C15)
 function rand_vec(g::_LCG, n)
@@ -301,6 +336,29 @@ function self_test()
     @assert flagof(bad) & SING != 0 && all(isfinite, coeffs(r))
     println("totality: NaN/1e308 input → flags ", string(flagof(bad), base = 2),
             ", exp stays finite ✓")
+    # ninv: division rebuilt as a tape — verified two-sided, INEXACT on zero divisors
+    A16 = cd_alg(16); g2 = _lcg()
+    xr = tadd(nel(A16), tscale(Nel(0.3 .* rand_vec(g2, 16), 0x00), 1.0))
+    yinv, r1 = ninv(A16, xr)
+    @assert r1 < 1e-6 && (flagof(yinv) & INEXACT) == 0
+    zd = zeros(16); zd[4] = 1.0; zd[11] = 1.0                 # 1−x = e3+e10 zero divisor
+    ybad, r2 = ninv(A16, tadd(nel(A16), tscale(nel(A16, zd), -1.0)))
+    @assert (flagof(ybad) & INEXACT) != 0
+    println("ninv: (1/x)·x = x·(1/x) = 1 at ", round(r1, sigdigits = 2),
+            " ✓ ; zero-divisor → INEXACT ✓ (division as a tape, no divider)")
+    # measured tensor law: a non-associative base keeps power-associativity under ⊗
+    # ONLY when the partner is commutative AND associative — either alone fails.
+    # (jordan(cd8) is the pincer: commutative ✓, associative ✗ → still loses it.)
+    for (partner, keeps) in ((cyclic_alg(3), true), (cd_alg(4), false), (jordan(cd_alg(8)), false))
+        T = tensor(cd_alg(8), partner); gt = _lcg()
+        pa = powerassoc_defect(T; rng = gt)
+        @assert (pa < 1e-9) == keeps "tensor law violated on $(T.name)"
+        xn = tadd(nel(T), tscale(Nel(0.25 .* rand_vec(gt, T.dim), 0x00), 0.5))
+        _, res = nlog(T, xn)
+        @assert (pa < 1e-9) == (res < 1e-6) "pow-assoc/verify mismatch on $(T.name)"
+    end
+    println("tensor law: ⊗-partner must be commutative AND associative to preserve",
+            " power-associativity (jordan pincer: commutative alone fails) ✓")
     # tape user-extensibility: a custom tape (Bessel-ish) runs on any Alg unchanged
     j0 = series(cd_alg(4), Nel(0.3 .* rand_vec(g, 4), 0x00),
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
