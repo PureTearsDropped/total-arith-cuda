@@ -140,6 +140,22 @@ python hyper_transcend.py            # per-dimension identity self-test (M = 1..
 python hyper_transcend.py --audit    # adversarial totality audit → NaN/Inf 0, exceptions 0, false-flags 0
 ```
 
+### `nested_series.py` / `nested_registry.py` — nesting and the twin shelves
+
+`nested_series.py`: the original three-layer experiment (matrix ⊃ sedenion ⊃ digit) —
+operation = coefficient tape on one skeleton; non-associativity infects upward; left-exp
+and left-log are NOT an inverse pair for non-associative cells (cell-swap decisive test).
+
+`nested_registry.py` (Python twin of `julia/NestedSeries.jl`): the generalization — every
+algebra is a structure tensor `T[i,j,k]` (product = one einsum; `jordan`/`lie` = literally
+symmetrize/antisymmetrize T). Twin preset shelves: **`ALGS`** (13 named algebras incl.
+Grassmann Λn — Λ1 = dual numbers ⇒ forward-mode AD `f(a+ε)=f(a)+f′(a)ε`; Clifford;
+`dualquat` = Λ1⊗ℍ rigid-body pose) × **`OPS`** (`nop(A,'sqrt',x)` — forward vs
+candidate+verify). Probes measure every combination; measured laws asserted in
+`python nested_registry.py`: exp∘log ⟺ power-associativity; ⊗-partner must be
+commutative AND associative; BCH repairs at s⁴ through octonions (Artin) and s³ at
+sedenions; Jacobi breaks at octonions.
+
 ### Julia — `julia/` (three modules, see `julia/README.md`)
 
 - **`HyperAlgebra.jl`** (basic algebra) — array/batch total arithmetic + swappable wiring
