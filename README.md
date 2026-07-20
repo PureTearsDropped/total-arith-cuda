@@ -115,76 +115,15 @@ the other factor's uncertainty vanishes, per `x×0=0` exact.
 
 Requires a CUDA GPU. Falls back to CPU (correctness holds; throughput numbers won't).
 
-### Demo — drone attitude control that survives sensor spikes (`demo_drone.py`)
+### Demos → [robust-attitude-control](../../robust-attitude-control)
 
-Quaternion attitude estimation (strapdown integration + normalization, quaternion product
-via `wiring_tensor('cd', 4)`) driving a PD-controlled rigid body, with rare huge gyro
-spikes (a model of real sensor glitches). The classic failure: `|q|²` overflows float32 →
-`inf` → normalization collapses → `0/0 = NaN` → control death.
-
-```
-python demo_drone.py        # 4 arms × 8 seeds  (CPU is fine — single quaternion per step)
-```
-
-Measured (5 spikes in 1500 steps, hover target):
-
-| arm | crashes | attitude error (median / worst) | spikes flagged | false pos |
-|---|---|---|---|---|
-| IEEE, no glitches (baseline) | 0/8 | 0.24° / 0.39° | — | — |
-| **IEEE float32** | **8/8** | — (all dead) | — | — |
-| total arithmetic (TOT) | 0/8 | 147.6° / 173.6° (airborne but lost) | 5/5 | 1 |
-| **TOT + flag rejection** | **0/8** | **0.29° / 0.54°** | 5/5 | **0** |
-
-Same two-layer structure as the gravity-law experiment in varpro-powersum-nn: totalization
-keeps the system alive; the flags name every poisoned sample, and rejecting them restores
-clean-baseline accuracy exactly.
-
-### Demo 2 — 6-DoF flight on one wiring kernel (`demo_flight.py`)
-
-Full pose (attitude **and** position) as a **dual quaternion** — Cayley–Dickson with a
-degenerate twist (ε² = 0) — composed by the *same* `group_mul` kernel with an 8-wide
-table, plus **motor mixing as a wiring**: the 4×4 mixer matrix is packed as a 16-component
-"number" in one operand and multiplied through a universal matrix-vector table. A
-pretzel trajectory (3-D Lissajous), 6 gyro spikes, cascade position/attitude control:
-
-| arm | crashes | tracking RMS | spikes flagged | false pos |
-|---|---|---|---|---|
-| IEEE, no glitches (baseline) | 0/3 | 0.059 m | — | — |
-| IEEE float32 | 3/3 | — | — | — |
-| total arithmetic, no rejection | 3/3 | — | (dies at 1st spike) | — |
-| **TOT + flag rejection** | **0/3** | **0.059 m** | 6/6 | 0 |
-
-Sharper lesson than demo 1: in 6-DoF, totalization alone is *not* enough — the arithmetic
-survives but the corrupted pose still diverges the controller. **The flags are the
-difference between surviving and completing the mission.**
-
-**Speed envelope** (same script, `speed_sweep()`): how much does *better attitude control*
-buy? Adding differential-flatness feedforward (the trajectory's jerk tells you the body
-rates it will require — supply the future instead of reacting to the past):
-
-| trajectory speed | peak | PD feedback only | PD + flatness FF |
-|---|---|---|---|
-| ×1.0 (3.4 m/s, 0.6 g) | | 9.3 cm | **1.3 cm** |
-| ×2.0 (6.8 m/s, 2.3 g) | | 206 cm (lost) | **3.7 cm** |
-| ×2.5 (8.4 m/s, 3.5 g) | | 216 cm | **6.7 cm** |
-| ×3.5 (11.8 m/s, 6.9 g) | | ✗ diverges | 204 cm (still flying) |
-
-~50× precision at racing speeds and a ~2× larger flight envelope, from a few lines of
-feedforward.
-
-**Gusts vs. lies** (`gust_demo()`, same script): three smooth gusts up to 8.5 m/s (a real
-force) plus the six gyro spikes (a lie), in one flight. Measured: the controller *fights*
-the wind (25–29 cm max deviation, recovered by gust end) while the flags *reject* the
-spikes (6/6 named) — and crucially, **0 false positives during gusts**: a physically
-possible force never trips the saturation flags. RMS with gusts+spikes equals RMS with
-gusts alone (0.117 m) — the lies cost exactly nothing. The flag is a detector for
-physically impossible numbers, not for hard conditions. Honest note: through the *noisy estimator* at gentle speeds the same FF
-slightly *hurt* (0.059→0.083 m RMS — `w_des` inherits sensor noise), so the glitch demo
-keeps plain PD; the sweep isolates control performance on clean state. Tools belong to
-their regimes. (This demo also caught a real
-library bug — `group_mul` crashed on wiring tables with empty output rows, a shape that
-hypercomplex algebras never produce but matrix-vector wirings do. Fixed in both
-implementations.)
+The drone / 6-DoF flight demos that exercise this library live in their own showcase repo,
+**[robust-attitude-control](../../robust-attitude-control)**: fault-tolerant attitude and
+position control that survives sensor spikes (IEEE crashes; total arithmetic + flag
+rejection completes the mission), quaternion product via `group_mul`, dual-quaternion pose,
+motor mixing as a wiring, and a differential-flatness speed envelope. Those demos also
+surfaced a real library bug here — `group_mul` crashed on wiring tables with empty output
+rows (matrix-vector wirings produce them; hypercomplex ones never do), now fixed.
 
 ### Julia port — `julia/TotalArith.jl`
 
