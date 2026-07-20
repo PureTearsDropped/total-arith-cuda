@@ -31,7 +31,8 @@ nested_series.py, generalized).
 """
 module NestedSeries
 
-export Alg, cd_alg, cyclic_alg, matn_alg, mat_over, tensor, jordan, lie, commutator,
+export Alg, cd_alg, cyclic_alg, matn_alg, grassmann_alg, clifford_alg,
+       mat_over, tensor, jordan, lie, commutator, ALGS, alg, list_algs,
        Nel, nel, coeffs, flagof, tmul, tadd,
        TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog, ninv,
        OPS, nop, list_ops, binom_tape,
@@ -97,6 +98,50 @@ cyclic_alg(M::Int) = _from_mul("cyc$M", M, Float64.(1:M .== 1),
 matn_alg(n::Int) = _from_mul("mat$n", n * n, vec(Matrix{Float64}(I0(n))),
     (x, y) -> vec(reshape(x, n, n) * reshape(y, n, n)))
 I0(n) = [i == j ? 1.0 : 0.0 for i in 1:n, j in 1:n]
+
+"sign of reordering basis blades: (−1)^#{(i,j): i∈A, j∈B, i>j} (bitmask blades)"
+function _reorder_sign(A::Int, B::Int)
+    cnt = 0
+    for i in 0:62
+        (A >> i) & 1 == 1 || continue
+        cnt += count_ones(B & ((1 << i) - 1))     # pairs (i∈A, j∈B, j<i) = transpositions
+    end
+    iseven(cnt) ? 1.0 : -1.0
+end
+
+"""Grassmann (exterior) algebra Λℝⁿ, dim 2ⁿ: eᵢeⱼ = −eⱼeᵢ, eᵢ² = 0 — every generator is
+   NILPOTENT, so series TERMINATE (exp is exactly a polynomial).  grassmann_alg(1) is the
+   dual numbers a+bε: f(a+ε) = f(a)+f′(a)ε — forward-mode automatic differentiation falls
+   out of the shelf as an algebra."""
+grassmann_alg(n::Int) = _from_mul("Λ$n", 1 << n, Float64.(1:(1 << n) .== 1),
+    (x, y) -> begin
+        D = 1 << n; r = zeros(D)
+        for a in 0:D-1
+            xa = x[a+1]; xa == 0.0 && continue
+            for b in 0:D-1
+                yb = y[b+1]; yb == 0.0 && continue
+                a & b == 0 || continue                        # overlap ⇒ eᵢ² = 0
+                r[(a ⊻ b) + 1] += _reorder_sign(a, b) * xa * yb
+            end
+        end
+        r
+    end)
+
+"""Clifford algebra Cl(n,0), dim 2ⁿ: the geometric product — eᵢeⱼ = −eⱼeᵢ but eᵢ² = +1
+   (same wiring as Grassmann with the overlap surviving instead of dying).  The Julia
+   mirror of the hardware repo's `_clifford_omega`."""
+clifford_alg(n::Int) = _from_mul("Cl$n", 1 << n, Float64.(1:(1 << n) .== 1),
+    (x, y) -> begin
+        D = 1 << n; r = zeros(D)
+        for a in 0:D-1
+            xa = x[a+1]; xa == 0.0 && continue
+            for b in 0:D-1
+                yb = y[b+1]; yb == 0.0 && continue
+                r[(a ⊻ b) + 1] += _reorder_sign(a, b) * xa * yb
+            end
+        end
+        r
+    end)
 
 # ================================================================ M layer: combinators
 """N×N matrix over any Alg — a new Alg of dim N²·cell.dim (block index (r,c,k)).
@@ -174,6 +219,43 @@ function lie(A::Alg)
 end
 "the commutator [a,b] = ab − ba on Nel — the order information itself"
 commutator(A::Alg, x, y) = tadd(tmul(A, x, y), tscale(tmul(A, y, x), -1.0))
+
+"""ALGS — the algebra preset shelf, OPS's twin on the N/M side.  Famous algebras by name,
+   each built from the registered cells and combinators (a preset IS a composition —
+   :dualquat is literally tensor(grassmann_alg(1), cd_alg(4))).  `alg(:name)` grabs one;
+   `list_algs()` prints each preset's MEASURED id-card (assoc / pow-assoc / commut) —
+   the shelf never asserts a property it hasn't measured."""
+const ALGS = Dict{Symbol,Function}(
+    :real       => () -> cd_alg(1),
+    :complex    => () -> cd_alg(2),
+    :quaternion => () -> cd_alg(4),
+    :octonion   => () -> cd_alg(8),
+    :sedenion   => () -> cd_alg(16),
+    :split      => () -> cyclic_alg(2),               # j² = +1: zero divisors at dim 2
+    :dual       => () -> grassmann_alg(1),            # ε² = 0: forward-mode AD
+    :grassmann2 => () -> grassmann_alg(2),            # fermions: everything nilpotent
+    :cl2        => () -> clifford_alg(2),             # geometric product (≅ M₂ℝ)
+    :cl3        => () -> clifford_alg(3),             # Pauli algebra
+    :dualquat   => () -> tensor(grassmann_alg(1), cd_alg(4)),  # rigid-body pose (drones)
+    :biquat     => () -> tensor(cd_alg(2), cd_alg(4)),         # complexified quaternions
+    :m4real     => () -> tensor(cd_alg(4), cd_alg(4)),         # ℍ⊗ℍ ≅ M₄ℝ (measured earlier)
+)
+alg(name::Symbol) = ALGS[name]()
+
+"print the shelf with each algebra's measured id-card — properties observed, not declared"
+function list_algs()
+    println(rpad("preset", 12), rpad("realizes", 22), rpad("dim", 5),
+            rpad("assoc", 7), rpad("pow-assoc", 11), "commut")
+    for nm in sort(collect(keys(ALGS)))
+        A = ALGS[nm]()
+        g = _lcg()
+        ad = assoc_defect(A; rng = g); pa = powerassoc_defect(A; rng = g)
+        cd_ = commut_defect(A; rng = g)
+        println(rpad(string(nm), 12), rpad(A.name, 22), rpad(string(A.dim), 5),
+                rpad(ad < 1e-9 ? "✓" : "✗", 7), rpad(pa < 1e-9 ? "✓" : "✗", 11),
+                cd_ < 1e-9 ? "✓" : "✗")
+    end
+end
 
 "element of an Alg: coefficients + flag; totalized at every step (never NaN/Inf)"
 struct Nel
@@ -493,6 +575,32 @@ function self_test()
     println("preset shelf: exp/sin/cos/sinh/cosh ≡ named fns ✓ ; √,∛ verified on cd16 ✓ ; ",
             "atan(0.5) matches ℝ ✓ ; √ on mat2⟨cd16⟩ (no pow-assoc): ",
             (flagof(zsq) & INEXACT) == 0 ? "verifies (2-factor identity!)" : "INEXACT (measured)")
+    # algebra preset shelf: id-cards measured live
+    println("--- ALGS shelf (id-cards measured, not declared) ---")
+    list_algs()
+    # dual numbers = forward-mode AD: f(a+ε) = f(a) + f′(a)ε — derivatives for free
+    D = alg(:dual); a0 = 1.2
+    xd = nel(D, [a0, 1.0])                                   # a + ε
+    for (nm, f, fp) in ((:exp, exp, exp), (:sin, sin, cos),
+                        (:sqrt, sqrt, t -> 1 / (2 * sqrt(t))), (:inv, t -> 1 / t, t -> -1 / t^2))
+        y = nop(D, nm, xd)
+        @assert (flagof(y) & INEXACT) == 0
+        @assert abs(coeffs(y)[1] - f(a0)) < 1e-9 && abs(coeffs(y)[2] - fp(a0)) < 1e-9
+    end
+    println("dual (=Λ1): f(a+ε)=f(a)+f′(a)ε for exp/sin/√/inv ✓ — AD falls out of the shelf")
+    # dual quaternions (drone pose): associative composite → whole shelf verifies on it
+    DQ = alg(:dualquat); gq = _lcg()
+    @assert assoc_defect(DQ; rng = gq) < 1e-9
+    xq = tadd(nel(DQ), tscale(Nel(0.3 .* rand_vec(gq, DQ.dim), 0x00), 0.5))
+    _, rq = nlog(DQ, xq)
+    @assert rq < 1e-6
+    println("dualquat (=Λ1⊗ℍ, rigid-body pose): associative ✓, exp∘log ",
+            round(rq, sigdigits = 2), " ✓ — the drone algebra straight off the shelf")
+    # nilpotency: Λ2 series TERMINATE — exp of a pure blade is exact at tiny order
+    G2 = alg(:grassmann2)
+    xg = nel(G2, [0.0, 0.7, 0.4, 0.0])
+    @assert maximum(abs.(coeffs(nexp(G2, xg; order = 3)) .- coeffs(nexp(G2, xg; order = 30)))) < 1e-15
+    println("Λ2: nilpotent ⇒ exp terminates (order 3 ≡ order 30 exactly) ✓")
     # tape user-extensibility: a custom tape (Bessel-ish) runs on any Alg unchanged
     j0 = series(cd_alg(4), Nel(0.3 .* rand_vec(g, 4), 0x00),
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
