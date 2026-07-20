@@ -125,6 +125,21 @@ motor mixing as a wiring, and a differential-flatness speed envelope. Those demo
 surfaced a real library bug here — `group_mul` crashed on wiring tables with empty output
 rows (matrix-vector wirings produce them; hypercomplex ones never do), now fixed.
 
+### `hyper_transcend.py` — transcendental functions for any-M hypercomplex (Python twin of Julia)
+
+`exp / log / sqrt / ^ / sin / cos / sinh / cosh` and a linear-ODE mover `left_action(a,x0,t)`
+for a hypercomplex number of **any** M = 2^k, via `f(x) = f(L_x)·e₀` (matrix function of the
+regular representation; `cuda_total.py` supplies the wiring table). Same three tiers as the
+[Julia twin](julia/README.md): **safe forward** (exp/trig/`x^{p≥0}`, total for every input incl.
+zero divisors), **candidate** (sqrt/log/fractional power — computed, then the defining identity
+verified by residual; else flagged `~`/INEXACT), **break** (log / `x^{neg}` of a zero divisor →
+`⟦零因子⟧`). NaN/Inf named at construction so no matrix routine can crash.
+
+```bash
+python hyper_transcend.py            # per-dimension identity self-test (M = 1..16)
+python hyper_transcend.py --audit    # adversarial totality audit → NaN/Inf 0, exceptions 0, false-flags 0
+```
+
 ### Julia — `julia/` (three modules, see `julia/README.md`)
 
 - **`HyperAlgebra.jl`** (basic algebra) — array/batch total arithmetic + swappable wiring
