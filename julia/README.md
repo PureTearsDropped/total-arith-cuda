@@ -21,6 +21,21 @@ shelf** (dualquat, Clifford, Grassmann, …) onto the audited kernel with flags 
 exposes the explicit M (implicit ≡ explicit asserted), `TotalPipe(:gmul, algebra)` is the
 declarative pair. `julia TotalPipeline.jl` runs the five-way self-test.
 
+## `Discovery.jl` — implicit law discovery, everything from this shelf
+
+Formalizes `demo_discovery.jl`: laws as `Σc·(monomials/derivative-columns) = 0`, solved as
+the null space of the library matrix (one SVD — no gradients, no seeds; trivial solutions
+are excluded structurally: c=0 by the unit sphere, `x^w−x^w` tautologies by the discrete
+grid). **The differentiation library is the shelf itself**: `HDNum` wraps Λ1⊗Λ1 (hyperdual
+numbers — the same mathematics inside ForwardDiff.jl) with ordinary Julia operators, and the
+nilpotent lift `f(s+n)=f(s)+f′(s)n+f″(s)n²/2` (exact — the series terminates) turns any
+elementary formula into exact ψ′, ψ″. Poison (Inf rails, NaN dropouts) is named by
+ScalarTot's audited entry and stays LOCAL (hyperdual evaluation is pointwise; finite
+differences would smear it). Measured in `self_test`: harmonic oscillator E=0.5 and hydrogen
+E=−0.5 to ~1e-15 with σ_min ≈ 4e-16, 10 poisoned points → exactly 10 rows excluded, and
+honest refusal (σ_min large) on lawless data. Python twin (complex support, e.g. discovering
+the imaginary unit in free Schrödinger): `varpro-powersum-nn/implicit_discovery.py`.
+
 ## `demo_ode_blowup.jl` — a third-party solver, unchanged, naming the blow-up
 
 Run `julia demo_ode_blowup.jl` (needs `OrdinaryDiffEq`, which you install yourself —
