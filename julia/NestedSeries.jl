@@ -31,8 +31,11 @@ nested_series.py, generalized).
 """
 module NestedSeries
 
+import LinearAlgebra                       # stdlib: I と pinv(自己テストの二証人)のみ使用
+
 export Alg, cd_alg, cyclic_alg, matn_alg, grassmann_alg, clifford_alg,
        mat_over, tensor, jordan, lie, commutator, ALGS, alg, list_algs,
+       Lmat_alg, Rmat_alg, nsolve_left, nsolve_right,
        Nel, nel, coeffs, flagof, tmul, tadd,
        TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog, ninv,
        OPS, nop, list_ops, binom_tape,
@@ -394,6 +397,76 @@ function list_ops()
     end
 end
 
+# ================================================================ solve: 方程式を解く除算
+# 「a/0 = 0 は Moore–Penrose の 1×1」の フルランク完成: solve_left は 同じ定理の dim×dim。
+# 除算の 家系(外部レビュー 2026-07-21 の 区別を 実装):
+#   代数式  x·ā/|a|²  … 常に 計算できるが、非結合(セデニオン)では ay=x の 解とは 限らない
+#   方程式の解 L_a⁺x  … ay=x の 最小ノルム最小二乗解。零因子でも 定義される
+# 実装は 乗算だけの Ben-Israel 反復(判断・除算・ピボットなし = 固定配線可 = newton_recip の
+# 行列版)。検算は 二層: 前向き残差 a·y≈x (厳密解) / 正規方程式残差 (最小二乗)。
+# フラグ: 厳密解→クリーン / 解なし(最小二乗のみ)→SING / 未収束→INEXACT — 解けたフリをしない。
+
+"left-multiplication matrix: (a·y)_k = Σ_i a_i tab[i][j][k] y_j — 構築は配線(積なし)"
+function Lmat_alg(A::Alg, a::AbstractVector)
+    L = zeros(A.dim, A.dim)
+    for i in 1:A.dim
+        ai = a[i]; ai == 0.0 && continue
+        ti = A.tab[i]
+        for j in 1:A.dim, k in 1:A.dim
+            L[k, j] += ai * ti[j][k]
+        end
+    end
+    L
+end
+
+"right-multiplication matrix: (y·a)_k = Σ_j a_j tab[i][j][k] y_i"
+function Rmat_alg(A::Alg, a::AbstractVector)
+    R = zeros(A.dim, A.dim)
+    for j in 1:A.dim
+        aj = a[j]; aj == 0.0 && continue
+        for i in 1:A.dim
+            tij = A.tab[i][j]
+            for k in 1:A.dim
+                R[k, i] += aj * tij[k]
+            end
+        end
+    end
+    R
+end
+
+"""乗算だけの擬似逆(Ben-Israel): X₀=Mᵀ·2^{-s} → X(2I−MX)。特異でも A⁺ に二次収束。
+   割り算ゼロ: 反復は 乗算と減算だけ。唯一のスケール 1/‖M‖₁‖M‖∞ は「上界なら何でもよい」ので
+   次の 2 のベキに 切り上げ ⟹ 指数の引き算 = 底 2 の付け替え = ハードでは ゲート 0 個
+   (gate_series の 2^{-s} と 同じ手筋)。solve は 端から端まで セルの数珠つなぎになる。"""
+function _pinv_mul(Mx::Matrix{Float64}, K::Int)
+    n1 = maximum(sum(abs, Mx; dims = 1)); ninf = maximum(sum(abs, Mx; dims = 2))
+    d = n1 * ninf
+    d == 0.0 && return zeros(size(Mx, 2), size(Mx, 1))   # a=0: L=0 ⟹ L⁺=0 (a/0=0 と同型)
+    X = Mx' .* exp2(-ceil(log2(d)))                       # 2^{-s}: 指数シフトのみ(除算不使用)
+    for _ in 1:K
+        X = X * (2 * LinearAlgebra.I - Mx * X)
+    end
+    X
+end
+
+function _solve_via(Mmat, mulfn, A::Alg, a::Nel, x::Nel, K::Int, tol::Float64)
+    Op = Mmat(A, a.c)
+    y = _tot(_pinv_mul(Op, K) * x.c, a.flag | x.flag)
+    r1 = maximum(abs.(coeffs(mulfn(y)) .- x.c))              # 前向き検算: 方程式が解けたか
+    r2 = maximum(abs.(Op' * (coeffs(mulfn(y)) .- x.c)))      # 正規方程式: 最小二乗の検算
+    f = r1 < tol ? y.flag :
+        (r2 < tol ? (y.flag | SING) : (y.flag | SING | INEXACT))
+    (Nel(y.c, f), r1, r2)
+end
+
+"solve a·y = x: 最小ノルム最小二乗解 L_a⁺x。厳密解→クリーン / 解なし→SING / 未収束→INEXACT"
+nsolve_left(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
+    _solve_via(Lmat_alg, y -> tmul(A, a, y), A, a, x, K, tol)
+
+"solve y·a = x: R_a⁺x (非可換なので 左と 一般に 別解)"
+nsolve_right(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
+    _solve_via(Rmat_alg, y -> tmul(A, y, a), A, a, x, K, tol)
+
 # ================================================================ measure, don't assume
 "max |(xy)z − x(yz)| over random triples — the associativity of the COMPOSED algebra"
 function assoc_defect(A::Alg; trials::Int = 4, rng = nothing)
@@ -601,6 +674,51 @@ function self_test()
     xg = nel(G2, [0.0, 0.7, 0.4, 0.0])
     @assert maximum(abs.(coeffs(nexp(G2, xg; order = 3)) .- coeffs(nexp(G2, xg; order = 30)))) < 1e-15
     println("Λ2: nilpotent ⇒ exp terminates (order 3 ≡ order 30 exactly) ✓")
+    # solve: 方程式を解く除算 (a/0=0 のフルランク完成)
+    println("--- solve: L⁺/R⁺ (乗算だけの Ben-Israel・零因子対応・二層検算) ---")
+    A16s = cd_alg(16); gs = _lcg()
+    a_r = Nel(rand_vec(gs, 16), 0x00); x_r = Nel(rand_vec(gs, 16), 0x00)
+    yL, r1, r2 = nsolve_left(A16s, a_r, x_r)
+    @assert r1 < 1e-8 && flagof(yL) == 0x00                    # 正則: 厳密解・クリーン
+    ypinv = LinearAlgebra.pinv(Lmat_alg(A16s, a_r.c)) * x_r.c  # 二証人: stdlib pinv
+    @assert maximum(abs.(coeffs(yL) .- ypinv)) < 1e-8
+    yR, _, _ = nsolve_right(A16s, a_r, x_r)
+    dLR = maximum(abs.(coeffs(yL) .- coeffs(yR)))
+    println("  正則a: a·y=x 残差 ", round(r1, sigdigits=2), " ✓ (pinv二証人一致) ; ",
+            "左解≠右解: |L⁺x−R⁺x| = ", round(dLR, sigdigits=2), " (非可換の実測)")
+    @assert dLR > 1e-3
+    # 零因子: L 特異でも 解ける x は 厳密に・解けない x は SING で 正直に
+    zd16 = Nel([i ∈ (4, 11) ? 1.0 : 0.0 for i in 1:16], 0x00)
+    y0 = Nel(rand_vec(gs, 16), 0x00)
+    x_in = tmul(A16s, zd16, y0)                                # range 内の x
+    ys1, s1, _ = nsolve_left(A16s, zd16, x_in)
+    @assert s1 < 1e-8 && flagof(ys1) == 0x00
+    x_out = Nel(rand_vec(gs, 16), 0x00)                        # range 外の x (一般)
+    ys2, t1, t2 = nsolve_left(A16s, zd16, x_out)
+    @assert t1 > 1e-3 && t2 < 1e-6 && (flagof(ys2) & SING) != 0
+    println("  零因子 e3+e10: range内→厳密解 ", round(s1, sigdigits=2), " ✓ ; ",
+            "range外→SING+最小二乗(正規方程式 ", round(t2, sigdigits=2), ") ✓ 解けたフリなし")
+    # 代数式 vs 方程式の解: conj-div y=(ā·x)/|a|² は 八元数まで解・セデニオンで破れる(実測)
+    println("  conj-div (ā·x/|a|²) は ay=x の解か: ")
+    for M in (4, 8, 16)
+        Am = cd_alg(M); gm = _lcg()
+        am = Nel(rand_vec(gm, M), 0x00); xm = Nel(rand_vec(gm, M), 0x00)
+        cj = Nel(vcat(am.c[1], -am.c[2:end]), 0x00)
+        ycj = tscale(tmul(Am, cj, xm), 1.0 / sum(abs2, am.c))
+        rc = maximum(abs.(coeffs(tmul(Am, am, ycj)) .- xm.c))
+        _, rs, _ = nsolve_left(Am, am, xm)
+        println("    cd", M, ": conj-div残差 ", round(rc, sigdigits=2),
+                (rc < 1e-8 ? " (解になる)" : " ✗(解でない)"),
+                " / nsolve残差 ", round(rs, sigdigits=2))
+        @assert (M <= 8) == (rc < 1e-8)                        # Artin: 八元数までは 2 元生成が結合的
+        @assert rs < 1e-8
+    end
+    # 棚の任意の代数でも 同じ 1 本: dualquat で solve
+    DQs = alg(:dualquat); gq2 = _lcg()
+    aq = Nel(rand_vec(gq2, 8), 0x00); xq = Nel(rand_vec(gq2, 8), 0x00)
+    _, rq2, _ = nsolve_left(DQs, aq, xq)
+    @assert rq2 < 1e-8
+    println("  棚の他代数 (dualquat): nsolve_left 残差 ", round(rq2, sigdigits=2), " ✓")
     # tape user-extensibility: a custom tape (Bessel-ish) runs on any Alg unchanged
     j0 = series(cd_alg(4), Nel(0.3 .* rand_vec(g, 4), 0x00),
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
