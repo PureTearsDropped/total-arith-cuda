@@ -111,6 +111,15 @@ def _wh_matrix(n):
     "ウォルシュ・アダマール H[f,i] = (−1)^{popcount(f&i)} — ±1のみ(乗算器ゼロの変換)"
     return np.array([[(-1.0) ** bin(f & i).count("1") for i in range(n)] for f in range(n)])
 
+def _cwh_matrix():
+    """複素WH (Chrestenson-4) = F₄⊗H₂: 成分 {±1,±i} のみ。×i = 実虚スワップ+符号 = 配線。
+       ℤ/4×ℤ/2 の指標変換 — 「タダの変換」の上限(指標がガウス整数の単数に収まる限界)。
+       位数8のアーベル群の実ランク階段: (ℤ/2)³:8 / ℤ/4×ℤ/2:10 / ℤ/8:12 (=2n−t) —
+       巡回性1段ごとに+2・ℤ/8で√2が現れて変換が初めて有料化(m値法則の変換版)。"""
+    F4 = np.array([[1,1,1,1],[1,-1j,-1,1j],[1,-1,1,-1],[1,1j,-1,-1j]])
+    H2 = np.array([[1,1],[1,-1]], dtype=complex)
+    return np.kron(F4, H2)
+
 def matn_alg(n):
     "real n×n matrices as a dim-n² algebra — associative, with zero divisors"
     return _from_mul(f"mat{n}", n * n, np.eye(n).ravel(),
@@ -372,6 +381,8 @@ IMPLS = {
     "xor8_naive":       lambda: naive_impl(xor_alg(8)),         # R=64
     "xor8_wh":          lambda: Impl("wh⟨xor8⟩", _wh_matrix(8), _wh_matrix(8),
                                      _wh_matrix(8) / 8),        # R=8・U,V,Wは±1のみ・厳密
+    "z4z2_cwh":         lambda: Impl("cwh⟨z4z2⟩", _cwh_matrix(), _cwh_matrix(),
+                                     _cwh_matrix().conj() / 8), # R=8複素・{±1,±i}=乗算器ゼロ
 }
 def impl(name): return IMPLS[name]()
 
@@ -382,7 +393,8 @@ def list_impls():
                "mat2_naive": matn_alg(2), "mat2_strassen": matn_alg(2),
                "gauss2": tensor(cd_alg(2), cd_alg(2)),
                "cyclic8_naive": cyclic_alg(8), "cyclic8_fft": cyclic_alg(8),
-               "xor8_naive": xor_alg(8), "xor8_wh": xor_alg(8)}
+               "xor8_naive": xor_alg(8), "xor8_wh": xor_alg(8),
+               "z4z2_cwh": tensor(cyclic_alg(4), cyclic_alg(2))}
     print(f"{'preset':<18}{'computes':<12}{'R(乗算)':<10}exact?")
     for nm in sorted(IMPLS):
         im, tg = IMPLS[nm](), targets[nm]
@@ -428,6 +440,8 @@ MAPS = {
     "dft8":  lambda: _dft_map(8),      # 時間→周波数 (畳み込み → 各点積)
     "idft8": lambda: _idft_map(8),     # 周波数→時間 (逆向きも 準同型)
     "wh8":   lambda: AlgMap("wh8", xor_alg(8), diag_alg(8), _wh_matrix(8)),   # XOR群のDFT(実!)
+    "cwh8":  lambda: AlgMap("cwh8", tensor(cyclic_alg(4), cyclic_alg(2)),
+                            diag_alg(8), _cwh_matrix()),        # ℤ/4×ℤ/2 のDFT({±1,±i})
 }
 def amap(name): return MAPS[name]()
 
@@ -603,6 +617,20 @@ def self_test():
         got = impl_mul(imw, Ai[i], Bi[i])
         assert np.abs(got - rawmul(xor_alg(8), Ai[i], Bi[i])).max() == 0.0   # 整数入力=全段厳密
     print("  WH=XOR群のDFT: 準同型✓ ΣUVW≡T 厳密0 ✓ R=8(±1変換=乗算器0) 整数入力で全段厳密 ✓")
+    # 複素WH (Chrestenson-4): {±1,±i} = ガウス単数まで = タダの変換の上限
+    cwh = amap("cwh8")
+    hc, uc = map_verify(cwh, rngm)
+    assert hc < 1e-12 and uc < 1e-12
+    imc = impl("z4z2_cwh")
+    z42 = tensor(cyclic_alg(4), cyclic_alg(2))
+    assert impl_verify(imc, z42) == 0.0
+    Ai2 = rngm.integers(-100, 101, (100, 8)).astype(np.float64)
+    Bi2 = rngm.integers(-100, 101, (100, 8)).astype(np.float64)
+    for i in range(100):
+        got = np.real(impl_mul(imc, Ai2[i], Bi2[i]))
+        assert np.abs(got - rawmul(z42, Ai2[i], Bi2[i])).max() == 0.0
+    print("  複素WH=ℤ/4×ℤ/2のDFT({±1,±i}=×iはスワップ=タダ): 準同型✓ ΣUVW厳密0✓ 整数厳密✓")
+    print("  実ランク階段(位数8): (ℤ/2)³:8 / ℤ/4×ℤ/2:10 / ℤ/8:12 — √2出現(m=8)で変換が有料化")
     # totality
     bad = nel(cd_alg(16), [np.nan] + [1e308] * 15)
     assert (bad.flag & SING) and np.isfinite(nexp(cd_alg(16), bad).c).all()
