@@ -94,21 +94,25 @@ c = Wᵀ((U·a) ⊙ (V·b))        (⊙ は成分ごとの積・R = 実乗算の
 
 **HW はサブセット ISA を実装する** (誇張しない)。空欄 = 未対応。
 
-| 命令 × honesty | CPU (nested_registry / ScalarTot.jl) | GPU (Triton) | HW (rtl/ 自動生成SV) |
-|---|---|---|---|
-| TOTALIZE | ✅ `Tot()` / `TotNum` | ✅ 融合 `fused_totalize` (Tot と bit一致・未融合比 7–11×) | ✅ 入口全域化 |
-| BILIN bare | ✅ rawmul / `tbm.bare_group_mul` | ✅ `cuda_fused_pipeline` | — |
-| BILIN coarse | ✅ `tbm.coarse_group_mul` | ✅ 同左 (非融合 einsum = 大バッチ最適・1.13×) | — |
-| BILIN evidence | ✅ group_mul | ✅ `cuda_fused` (フラグbit一致契約) | ✅ `sd_mult10` (状態7ゲート/成分) |
-| LINMAP | ✅ MAPS.apply_fast | ✅ (torch matmul = bare) | — |
-| AXPY | ✅ tot_add | ✅ | ✅ `sd_add2` |
-| NORM | ✅ gate_bfp (pyシミュ) | — | ✅ `blocknorm` |
-| CHECK | ✅ probe 群 | (CPUで実行 — 検算は高さを選ばない) | — |
+| 命令 × honesty | CPU (torch) | GPU (Triton) | Julia (`julia/Tbm.jl`) | HW (rtl/ 自動生成SV + ゲートgolden) |
+|---|---|---|---|---|
+| TOTALIZE | ✅ `Tot()` | ✅ 融合 `fused_totalize` (bit一致・7–11×) | ✅ `HA.Tot` | ✅ 入口 (整数→SD) |
+| BILIN bare | ✅ `tbm.bare_group_mul` | ✅ `cuda_fused_pipeline` | ✅ | — |
+| BILIN coarse | ✅ `tbm.coarse_group_mul` | ✅ 同左 (非融合 einsum・1.13×) | ✅ | — |
+| BILIN evidence | ✅ group_mul | ✅ `cuda_fused` (bit一致契約) | ✅ `HA.group_mul` | ✅ `sed_comp`/`sd_mult10` |
+| LINMAP | ✅ MAPS.apply_fast | ✅ (torch matmul = bare) | ✅ (wh8) | — |
+| AXPY | ✅ tot_add | ✅ | ✅ | ✅ `sd_add2` |
+| NORM | ✅ gate golden 委譲 | — | — | ✅ `blocknorm` |
+| CHECK | ✅ LAWS 4種 | (CPUで実行) | ✅ LAWS 3種 (rank_exact 空欄) | — |
+| width ダイヤル | ✅ f64/f32 | ✅ | ✅ f64/f32 | (厳密整数 — 丸め自体なし) |
 
 適合水準: **L0** = bare で値一致 / **L1** = + coarse フラグ一致 / **L2** = + evidence bit一致。
-現状: CPU=L2, GPU=L2, HW=L2 (サブセット: TOTALIZE/BILIN/AXPY/NORM)。
-アセンブラは `tbm.py` (LAWS 棚込み)・適合試験は `run_everywhere.py` (§7) — **2026-07-21 合格**:
-同一プログラムが 3 バックエンドで 値 bit一致・フラグ bit一致 (敵対的 Inf/NaN 注入・飽和フラグ込み)。
+現状: CPU=L2, GPU=L2, **Julia=L2** (独立実装どうしの言語間 bit一致), HW=L2 (サブセット)。
+アセンブラは `tbm.py` / `julia/Tbm.jl` / `total-arith-hardware/tbm_gates.py` の 3 つ子
+(同形の Program・意味論は各高さの監査済み実装へ委譲)。適合試験は `run_everywhere.py` (§7)
+— **2026-07-21 合格**: 同一プログラムが 4 実行系 (CPU/GPU/Julia/RTL) で 値 bit一致・
+フラグ bit一致 (敵対的 Inf/NaN 注入・飽和フラグ込み)。ゲート級はさらに `tbm_gates.py` が
+命令ごとのゲート評価数 (BILIN 6.4M/6ケース等) を「配線=計算の請求書」として印字する。
 
 ## 5. 標準ライブラリ (マクロ)
 

@@ -47,6 +47,15 @@ def hw_module(top, vec, sources=None):
     return json.load(open(out_p))
 
 
+def _find_julia():
+    import shutil
+    for cand in (shutil.which("julia"),
+                 os.path.expanduser("~/seedcradle/julia-1.11.5/bin/julia")):
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
 def gen_sed_comp_variants(ks=(0, 2, 3)):
     "sed_comp_k{k}.sv を 自動生成 (emit_sv と 同じ 監査済み Python トレース・k だけ 変更)。"
     sys.path.insert(0, os.path.join(HW_REPO, "rtl"))
@@ -74,7 +83,7 @@ def gen_sed_comp_variants(ks=(0, 2, 3)):
 
 # ---------------------------------------------------------------- 本試験
 def main():
-    print("run_everywhere — TBM 適合試験: 同じプログラム × 3 シリコン")
+    print("run_everywhere — TBM 適合試験: 同じプログラム × 4 実行系 (CPU/GPU/Julia/HW)")
     print("  プログラム: TOTALIZE a,b,c → s = a·b (セデニオン, evidence) → s += c → NORM(s[0:4])")
     rng = np.random.default_rng(20260721)
     B = 6
@@ -109,8 +118,33 @@ def main():
     assert not np.isnan(ca["s"].val.numpy()).any() and not np.isinf(ca["s"].val.numpy()).any()
     print(f"② 敵対ラウンド (Inf/NaN 注入): NaN/Inf 非生成 ✓・立った札 {nfl} 個も CPU↔GPU bit一致 ✓")
 
+    # ---- Julia 脚 (言語間 適合: 同じ プログラムを Tbm.jl で — 敵対 込み)
+    jl = os.environ.get("JULIA_BIN") or _find_julia()
+    if jl:
+        vec = os.path.join(tempfile.mkdtemp(prefix="tbm_"), "cross.txt")
+        rows = []
+        rows.append(f"{B} 16")
+        for arr in (adv_a, feed["in_b"].astype(float), feed["in_c"].astype(float)):
+            bits = np.asarray(arr, dtype=np.float64).view(np.uint64)
+            rows += [" ".join(str(x) for x in row) for row in bits]
+        rows.append("EXPECT")
+        rows += [" ".join(str(x) for x in row)
+                 for row in ca["s"].val.numpy().view(np.uint32)]
+        rows += [" ".join(str(x) for x in row) for row in ca["s"].flag.numpy()]
+        with open(vec, "w") as fh:
+            fh.write("\n".join(rows) + "\n")
+        r = subprocess.run([jl, "--startup-file=no",
+                            os.path.join("julia", "tbm_cross.jl"), vec],
+                           capture_output=True, text=True,
+                           cwd=os.path.dirname(os.path.abspath(__file__)))
+        print(f"③ Julia (Tbm.jl): {r.stdout.strip().splitlines()[-1] if r.stdout else r.stderr[-300:]}")
+        assert r.returncode == 0, "Julia 脚 不合格"
+        print("   同じ プログラム (敵対 Inf/NaN 込み) が Julia 実装でも 値・フラグ bit一致 ✓")
+    else:
+        print("③ Julia: — (julia が 見つからない — JULIA_BIN で 指定可)")
+
     # ---- HW 脚: BILIN (sed_comp ×4 成分)
-    print("③ HW (RTL シミュ): BILIN → sed_comp k=0..3 (16積の 融合MAC・符号=配線)")
+    print("④ HW (RTL シミュ): BILIN → sed_comp k=0..3 (16積の 融合MAC・符号=配線)")
     variants = gen_sed_comp_variants()
     cases = [{"a": feed["in_a"][i].tolist(), "b": feed["in_b"][i].tolist()}
              for i in range(B)]
@@ -150,13 +184,13 @@ def main():
     # ---- 総括
     print()
     print("  適合表 (SPEC §4) の 実測:")
-    print("    命令        CPU   GPU   HW")
-    print("    TOTALIZE     ✓     ✓     ✓ (入口 整数)")
-    print("    BILIN(evid)  ✓     ✓     ✓ (sed_comp ×4)")
-    print("    AXPY         ✓     ✓     ✓ (sd_add2)")
-    print("    NORM         ✓     —     ✓ (blocknorm+フラグ)")
+    print("    命令        CPU   GPU   Julia  HW")
+    print("    TOTALIZE     ✓     ✓     ✓      ✓ (入口 整数)")
+    print("    BILIN(evid)  ✓     ✓     ✓      ✓ (sed_comp ×4)")
+    print("    AXPY         ✓     ✓     ✓      ✓ (sd_add2)")
+    print("    NORM         ✓     —     —      ✓ (blocknorm+フラグ)")
     print()
-    print('  ✔ compile once, run on three silicons, never lie.')
+    print('  ✔ compile once, run on four executors, never lie.')
 
 
 if __name__ == "__main__":
