@@ -97,6 +97,20 @@ def diag_alg(M):
         T[f, f, f] = 1.0
     return Alg(f"diag{M}", np.ones(M), T)
 
+def xor_alg(n):
+    """XOR群 (ℤ/2)^k の群環 (符号なし=捻れなしCD・可換結合): e_i·e_j = e_{i⊻j}。
+       指標が全部±1の実数値 ⟹ DFT = ウォルシュ・アダマール・ランク = n ちょうど
+       (2n−t の t=n の 最良ケース)。cd 族の ω≡+1 極限 = このファブリックの母語。"""
+    T = np.zeros((n, n, n))
+    for i in range(n):
+        for j in range(n):
+            T[i, j, i ^ j] = 1.0
+    return Alg(f"xor{n}", np.eye(n)[0], T)
+
+def _wh_matrix(n):
+    "ウォルシュ・アダマール H[f,i] = (−1)^{popcount(f&i)} — ±1のみ(乗算器ゼロの変換)"
+    return np.array([[(-1.0) ** bin(f & i).count("1") for i in range(n)] for f in range(n)])
+
 def matn_alg(n):
     "real n×n matrices as a dim-n² algebra — associative, with zero divisors"
     return _from_mul(f"mat{n}", n * n, np.eye(n).ravel(),
@@ -355,6 +369,9 @@ IMPLS = {
     "gauss2":           lambda: impl_kron(_gauss_cd2(), _gauss_cd2()),  # cd2⊗cd2, R=9<16
     "cyclic8_naive":    lambda: naive_impl(cyclic_alg(8)),      # R=64
     "cyclic8_fft":      lambda: _dft_impl(8),                   # R=8 ← 畳み込み定理
+    "xor8_naive":       lambda: naive_impl(xor_alg(8)),         # R=64
+    "xor8_wh":          lambda: Impl("wh⟨xor8⟩", _wh_matrix(8), _wh_matrix(8),
+                                     _wh_matrix(8) / 8),        # R=8・U,V,Wは±1のみ・厳密
 }
 def impl(name): return IMPLS[name]()
 
@@ -364,7 +381,8 @@ def list_impls():
                "quaternion_naive": cd_alg(4), "sedenion_naive": cd_alg(16),
                "mat2_naive": matn_alg(2), "mat2_strassen": matn_alg(2),
                "gauss2": tensor(cd_alg(2), cd_alg(2)),
-               "cyclic8_naive": cyclic_alg(8), "cyclic8_fft": cyclic_alg(8)}
+               "cyclic8_naive": cyclic_alg(8), "cyclic8_fft": cyclic_alg(8),
+               "xor8_naive": xor_alg(8), "xor8_wh": xor_alg(8)}
     print(f"{'preset':<18}{'computes':<12}{'R(乗算)':<10}exact?")
     for nm in sorted(IMPLS):
         im, tg = IMPLS[nm](), targets[nm]
@@ -409,6 +427,7 @@ def _idft_map(n):
 MAPS = {
     "dft8":  lambda: _dft_map(8),      # 時間→周波数 (畳み込み → 各点積)
     "idft8": lambda: _idft_map(8),     # 周波数→時間 (逆向きも 準同型)
+    "wh8":   lambda: AlgMap("wh8", xor_alg(8), diag_alg(8), _wh_matrix(8)),   # XOR群のDFT(実!)
 }
 def amap(name): return MAPS[name]()
 
@@ -572,6 +591,18 @@ def self_test():
     assert np.abs(np.real(impl_mul(imf, xa, xb)) - rawmul(cyclic_alg(8), xa, xb)).max() < 1e-10
     print("  freq代数: 冪等✓ 零因子✓ / DFT・IDFT: 準同型+単位元+可逆 ✓ /")
     print("  ランダム行列は準同型でないと検出 ✓ / 畳み込み定理: ΣUVW≡T_cyc・R=64→8 ✓")
+    # WH = XOR群のDFT (実±1のみ) — ユーザの想起: 巡回のWinograd(R=12)より良いR=8・厳密
+    wh = amap("wh8")
+    hw, uw = map_verify(wh, rngm)
+    assert hw < 1e-12 and uw < 1e-12
+    imw = impl("xor8_wh")
+    assert impl_verify(imw, xor_alg(8)) == 0.0 and imw.R == 8   # ±1と/8だけ ⟹ 厳密に0
+    Ai = rngm.integers(-100, 101, (200, 8)).astype(np.float64)
+    Bi = rngm.integers(-100, 101, (200, 8)).astype(np.float64)
+    for i in range(200):
+        got = impl_mul(imw, Ai[i], Bi[i])
+        assert np.abs(got - rawmul(xor_alg(8), Ai[i], Bi[i])).max() == 0.0   # 整数入力=全段厳密
+    print("  WH=XOR群のDFT: 準同型✓ ΣUVW≡T 厳密0 ✓ R=8(±1変換=乗算器0) 整数入力で全段厳密 ✓")
     # totality
     bad = nel(cd_alg(16), [np.nan] + [1e308] * 15)
     assert (bad.flag & SING) and np.isfinite(nexp(cd_alg(16), bad).c).all()
