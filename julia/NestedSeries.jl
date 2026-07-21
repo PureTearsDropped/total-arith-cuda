@@ -35,7 +35,7 @@ import LinearAlgebra                       # stdlib: I と pinv(自己テスト�
 
 export Alg, cd_alg, cyclic_alg, matn_alg, grassmann_alg, clifford_alg,
        mat_over, tensor, jordan, lie, commutator, ALGS, alg, list_algs,
-       Lmat_alg, Rmat_alg, nsolve_left, nsolve_right,
+       Lmat_alg, Rmat_alg, nsolve_left, nsolve_right, nsolve_batch,
        nconj, nconj_div_left, nconj_div_right, nnorm_div, nnormalize,
        nleft_action, nright_action,
        Nel, nel, coeffs, flagof, tmul, tadd,
@@ -468,6 +468,51 @@ nsolve_left(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
 "solve y·a = x: R_a⁺x (非可換なので 左と 一般に 別解)"
 nsolve_right(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
     _solve_via(Rmat_alg, y -> tmul(A, y, a), A, a, x, K, tol)
+
+"""nsolve_batch — バッチ solve の「Julia 流の融合」: 割り当てゼロ・バッファ使い回し・
+   構造テンソルの 密配列化で L 構築も 反復も 検算も 1 パス (cuda_fused_solve.py の CPU 双子)。
+   返り値 (Y, flags): flags は nsolve_left と 同じ規約 (0=厳密解 / SING=最小二乗 / +INEXACT)。"""
+function nsolve_batch(A::Alg, as::Matrix{Float64}, xs::Matrix{Float64};
+                      K::Int = 25, tol::Float64 = 1e-8)
+    Md = A.dim; B = size(as, 1)
+    Tt = zeros(Md, Md, Md)                        # Tt[k,j,i] = tab[i][j][k] (L構築を列走査に)
+    for i in 1:Md, j in 1:Md, k in 1:Md
+        Tt[k, j, i] = A.tab[i][j][k]
+    end
+    Y = zeros(B, Md); flags = zeros(UInt8, B)
+    L = zeros(Md, Md); X = zeros(Md, Md)
+    T1 = zeros(Md, Md); T2 = zeros(Md, Md)
+    y = zeros(Md); res = zeros(Md); nres = zeros(Md)
+    @inbounds for b in 1:B
+        fill!(L, 0.0)
+        for i in 1:Md
+            ai = as[b, i]; ai == 0.0 && continue
+            @views L .+= ai .* Tt[:, :, i]
+        end
+        n1 = maximum(sum(abs, L; dims = 1)); ninf = maximum(sum(abs, L; dims = 2))
+        d = n1 * ninf
+        if d == 0.0
+            flags[b] = SING; continue             # a=0: L⁺=0 (a/0=0 と同型)
+        end
+        X .= L' ./ d
+        for _ in 1:K
+            LinearAlgebra.mul!(T1, L, X)
+            T1 .= .-T1
+            for i in 1:Md; T1[i, i] += 2.0; end   # T1 = 2I − LX
+            LinearAlgebra.mul!(T2, X, T1)
+            X, T2 = T2, X
+        end
+        @views LinearAlgebra.mul!(y, X, xs[b, :])
+        LinearAlgebra.mul!(res, L, y)
+        @views res .-= xs[b, :]
+        r1 = maximum(abs, res)
+        LinearAlgebra.mul!(nres, L', res)
+        r2 = maximum(abs, nres)
+        flags[b] = r1 < tol ? 0x00 : (r2 < tol ? SING : (SING | INEXACT))
+        Y[b, :] .= y
+    end
+    Y, flags
+end
 
 # ---------------------------------------------------------------- exp の家族(残り2人)
 # exp の 5 分類の 完備: 左結合/右結合 = series(bracket)・対称化 = nexp(jordan(A),·)・

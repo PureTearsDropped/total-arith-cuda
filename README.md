@@ -137,6 +137,20 @@ cd16, flagged): the legacy flagged path has a batch-independent ~36ms floor (per
 the existing einsum path (memory-optimal there). The win is exactly the control-loop /
 per-sample regime — a 1 kHz attitude loop fits in 63µs, not in 36ms.
 
+### `cuda_fused_solve.py` — the solve family as one fused kernel
+
+`nsolve` (equation-solving division `L_a⁺x`) fused into a single Triton kernel: per element,
+building `L_a` from the wiring table, K Ben-Israel iterations `X←X(2I−LX)` (multiplication
+only), `y=X·x`, AND the two-tier verification (forward residual → exact / normal equations →
+least-squares SING / neither → SING|INEXACT) all stay in registers — one launch, one HBM
+round trip, `tl.dot(..., input_precision="ieee")` (no silent tf32). Semantics two-witnessed
+against `torch.linalg.pinv(float64)`: regulars 3.1e-7, zero-divisor least-squares 5.5e-8,
+flags honest, NaN poison propagated. Measured (RTX 5090, cd16): **B=1M: 27× vs batched
+`pinv`, 19× vs unfused Ben-Israel — 53.5M solves/s**; small batches are launch-bound (1.7×).
+Julia CPU twin: `nsolve_batch` in `julia/NestedSeries.jl` (allocation-free single pass,
+2.3× vs the naive loop, 0.08M solves/s single-threaded ≈ single-core BLAS floor; values and
+flags match the sequential `nsolve_left` to 2.2e-15).
+
 ### `hyper_transcend.py` — transcendental functions for any-M hypercomplex (Python twin of Julia)
 
 `exp / log / sqrt / ^ / sin / cos / sinh / cosh` and a linear-ODE mover `left_action(a,x0,t)`
