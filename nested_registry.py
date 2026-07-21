@@ -430,12 +430,23 @@ class AlgMap:
        map_verify が 測る。ALGS(何を)×OPS(どの関数)×IMPLS(どう)に 続く 4 枚目:
        MAPS(どの代数の 言葉に 翻訳するか)。第 1 号 = DFT(時間の畳み込み代数 → 周波数の
        各点積代数 = Wedderburn 標準形への 基底変換)。"""
-    __slots__ = ("name", "src", "dst", "M")
-    def __init__(self, name, src, dst, M):
+    __slots__ = ("name", "src", "dst", "M", "factors")
+    def __init__(self, name, src, dst, M, factors=None):
         self.name, self.src, self.dst = name, src, dst
         self.M = np.asarray(M)
+        # factors: M の 疎因数分解(バタフライ等)。「FFT = 変換行列の疎因数分解」を
+        # データとして持つ — ランク R(双線形の中身)と 直交する 第2のダイヤル(適用コスト)。
+        self.factors = [np.asarray(f) for f in factors] if factors is not None else None
     def __call__(self, a):
         return self.M @ np.asarray(a)
+    def apply_fast(self, a):
+        "因子列を 右から 順に 適用 (n² → 因子の非ゼロ総数 ≈ n log n)"
+        if self.factors is None:
+            return self.M @ np.asarray(a)
+        y = np.asarray(a)
+        for f in reversed(self.factors):
+            y = f @ y
+        return y
     def __repr__(self): return f"AlgMap({self.name}: {self.src.name}→{self.dst.name})"
 
 def map_verify(mp, rng=None, trials=6):
@@ -450,11 +461,36 @@ def map_verify(mp, rng=None, trials=6):
         rhs = rawmul(mp.dst, mp(a), mp(b))
         worst = max(worst, float(np.abs(lhs - rhs).max()))
     unit = float(np.abs(mp(mp.src.unit) - mp.dst.unit).max())
+    if mp.factors is not None:
+        P = mp.factors[0]
+        for f in mp.factors[1:]:
+            P = P @ f
+        worst = max(worst, float(np.abs(P - mp.M).max()))    # 因子の積 ≡ M (FFT=正しい分解か)
     return worst, unit
+
+def _wh_factors(n):
+    "WH のバタフライ: H_{2^k} = Π (I⊗H₂⊗I) — 全因子±1・行あたり非ゼロ2・積は厳密"
+    H2 = np.array([[1., 1], [1, -1]])
+    k = n.bit_length() - 1
+    return [np.kron(np.kron(np.eye(2**s_), H2), np.eye(2**(k-1-s_))) for s_ in range(k)]
+
+def _dft_factors(n):
+    "DFT の Cooley-Tukey 全段: バタフライ + twiddle対角(=捻れの請求書) + 並べ替え"
+    if n == 2:
+        return [np.array([[1, 1], [1, -1]], dtype=complex)]
+    w = np.exp(-2j * np.pi / n)
+    h = n // 2
+    P = np.zeros((n, n))
+    for k in range(h):
+        P[k, 2*k] = 1; P[k+h, 2*k+1] = 1
+    D = np.diag(np.concatenate([np.ones(h), w ** np.arange(h)]))
+    F2 = np.array([[1, 1], [1, -1]], dtype=complex)
+    return ([np.kron(F2, np.eye(h)), D]
+            + [np.kron(np.eye(2), S) for S in _dft_factors(h)] + [P])
 
 def _dft_map(n):
     F = np.exp(-2j * np.pi / n) ** np.outer(np.arange(n), np.arange(n))
-    return AlgMap(f"dft{n}", cyclic_alg(n), diag_alg(n), F)
+    return AlgMap(f"dft{n}", cyclic_alg(n), diag_alg(n), F, factors=_dft_factors(n))
 
 def _idft_map(n):
     F = np.exp(-2j * np.pi / n) ** np.outer(np.arange(n), np.arange(n))
@@ -463,7 +499,8 @@ def _idft_map(n):
 MAPS = {
     "dft8":  lambda: _dft_map(8),      # 時間→周波数 (畳み込み → 各点積)
     "idft8": lambda: _idft_map(8),     # 周波数→時間 (逆向きも 準同型)
-    "wh8":   lambda: AlgMap("wh8", xor_alg(8), diag_alg(8), _wh_matrix(8)),   # XOR群のDFT(実!)
+    "wh8":   lambda: AlgMap("wh8", xor_alg(8), diag_alg(8), _wh_matrix(8),
+                            factors=_wh_factors(8)),        # XOR群のDFT(実!)+バタフライ因子
     "cwh8":  lambda: AlgMap("cwh8", tensor(cyclic_alg(4), cyclic_alg(2)),
                             diag_alg(8), _cwh_matrix()),        # ℤ/4×ℤ/2 のDFT({±1,±i})
 }
@@ -662,6 +699,17 @@ def self_test():
         assert np.abs(got - rawmul(z42, Ai2[i], Bi2[i])).max() == 0.0
     print("  実ランク10実装: R=10ちょうど・ΣUVW≡T✓・整数入力厳密✓ (=2n−t, ℝ⁴⊕ℂ²)")
     print("  実ランク階段(位数8, ℤ/8はℝ²⊕ℂ³に訂正): 8 / 10 / 11 (有理係数制限なら ℤ/8=12)")
+    # FFT = 変換行列の疎因数分解 — MAPSの住人が factors として保持・検証・高速適用
+    for nm in ("wh8", "dft8"):
+        mpf = amap(nm)
+        h2, _ = map_verify(mpf, rngm)               # 因子積≡M も込みで検証
+        assert h2 < 1e-12
+        xa = rngm.standard_normal(8)
+        assert np.abs(mpf.apply_fast(xa) - mpf(xa)).max() < 1e-12
+    nz_dense = 64
+    nz_wh = sum(int((np.abs(f) > 1e-12).sum()) for f in amap("wh8").factors)
+    print(f"  FFT=疎因数分解: wh8/dft8 の因子積≡M ✓ apply_fast≡密適用 ✓"
+          f" (非ゼロ {nz_dense}→{nz_wh}; n=1024では 100万→2万)")
     # totality
     bad = nel(cd_alg(16), [np.nan] + [1e308] * 15)
     assert (bad.flag & SING) and np.isfinite(nexp(cd_alg(16), bad).c).all()
