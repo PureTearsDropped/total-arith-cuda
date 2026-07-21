@@ -37,6 +37,7 @@ export Alg, cd_alg, cyclic_alg, matn_alg, grassmann_alg, clifford_alg,
        mat_over, tensor, jordan, lie, commutator, ALGS, alg, list_algs,
        Lmat_alg, Rmat_alg, nsolve_left, nsolve_right,
        nconj, nconj_div_left, nconj_div_right, nnorm_div, nnormalize,
+       nleft_action, nright_action,
        Nel, nel, coeffs, flagof, tmul, tadd,
        TAPES, series, nexp, nsin, ncos, nsinh, ncosh, nexp_ss, nlog, ninv,
        OPS, nop, list_ops, binom_tape,
@@ -468,6 +469,29 @@ nsolve_left(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
 nsolve_right(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
     _solve_via(Rmat_alg, y -> tmul(A, y, a), A, a, x, K, tol)
 
+# ---------------------------------------------------------------- exp の家族(残り2人)
+# exp の 5 分類の 完備: 左結合/右結合 = series(bracket)・対称化 = nexp(jordan(A),·)・
+# 左作用/右作用 = exp(t·L_a)·x₀ / x₀·exp(t·R_a)。除算の家族と 同じハブ L_a/R_a を 使う:
+# exp(L_a) は 流れ(ẋ=a·x の解)・L_a⁺ は 除算 — 1 つの 行列の 2 つの 顔。
+# 恒等式(自己テストで検証): 単位元に 当てると 左作用 = 左結合 exp・右作用 = 右結合 exp。
+
+function _action_series(Op::Matrix{Float64}, x0::Nel, t::Float64, order::Int, inflag::UInt8)
+    acc = copy(x0.c); term = copy(x0.c)
+    for k in 1:order
+        term = (t / k) .* (Op * term)                    # (tL)ᵏ/k!·x₀ — 行列×ベクトルだけ
+        acc .+= term
+    end
+    _tot(acc, inflag)
+end
+
+"左作用 exp: x(t) = exp(t·L_a)·x₀ = 線形 ODE ẋ = a·x の解。乗算だけの級数"
+nleft_action(A::Alg, a::Nel, x0::Nel, t::Float64; order::Int = 24) =
+    _action_series(Lmat_alg(A, a.c), x0, t, order, a.flag | x0.flag)
+
+"右作用 exp: x(t) = exp(t·R_a)·x₀ = ẋ = x·a の解"
+nright_action(A::Alg, a::Nel, x0::Nel, t::Float64; order::Int = 24) =
+    _action_series(Rmat_alg(A, a.c), x0, t, order, a.flag | x0.flag)
+
 # ---------------------------------------------------------------- 除算の家族(残り3人)
 # 外部レビュー(2026-07-21)の 5 分類を 棚に 完備: ①conj-div ②solve_left ③solve_right
 # ④norm_div ⑤normalize (+ ninv=幾何級数テープ)。①は「常に計算できる 代数式」であって
@@ -756,6 +780,26 @@ function self_test()
     _, rq2, _ = nsolve_left(DQs, aq, xq)
     @assert rq2 < 1e-8
     println("  棚の他代数 (dualquat): nsolve_left 残差 ", round(rq2, sigdigits=2), " ✓")
+    # exp の家族 5 人: 左結合/右結合/対称化(jordan)/左作用/右作用 — 恒等式で結線
+    ge_ = _lcg()
+    A16e = cd_alg(16)
+    ae = Nel(0.3 .* rand_vec(ge_, 16), 0x00)
+    one16 = nel(A16e)
+    dL = maximum(abs.(coeffs(nleft_action(A16e, ae, one16, 1.0)) .- coeffs(nexp(A16e, ae))))
+    dR = maximum(abs.(coeffs(nright_action(A16e, ae, one16, 1.0)) .-
+                      coeffs(nexp(A16e, ae; bracket = :right))))
+    @assert dL < 1e-10 && dR < 1e-10           # 単位元に当てると 作用 = 結合 exp
+    x0e = Nel(0.3 .* rand_vec(ge_, 16), 0x00)
+    dt = 1e-6
+    num = (coeffs(nleft_action(A16e, ae, x0e, dt)) .- coeffs(x0e)) ./ dt
+    @assert maximum(abs.(num .- coeffs(tmul(A16e, ae, x0e)))) < 1e-3   # ẋ=a·x の有限差分検証
+    js = nexp(jordan(A16e), ae)                # 対称化 exp = jordan 結合子経由(1 行)
+    # 単一元では a∘a = a² ⟹ 対称化 exp ≡ 左結合 exp (べき結合律の潰れが jordan にも及ぶ。
+    # 当初の「別物」assert は これに 反証された — 家族が 割れるのは 多元/行列でだけ、
+    # は brackets 行(mat2⟨cd16⟩ 左vs右 0.012)で 既に 実測済み)
+    @assert maximum(abs.(coeffs(js) .- coeffs(nexp(A16e, ae)))) < 1e-10
+    println("  exp の家族5人: 作用(単位元)≡結合 ✓ ; ẋ=a·x 有限差分 ✓ ; ",
+            "対称化も単一元では一致(潰れの法則) ✓ — L_a は exp(流れ)と L⁺(除算)の共有ハブ")
     # 除算の家族 5 人 (レビューの分類の完備) — conj-div の INEXACT は Hurwitz が押す
     gd = _lcg()
     for (M, solves) in ((4, true), (8, true), (16, false))
