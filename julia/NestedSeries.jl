@@ -719,6 +719,20 @@ function self_test()
     _, rq2, _ = nsolve_left(DQs, aq, xq)
     @assert rq2 < 1e-8
     println("  棚の他代数 (dualquat): nsolve_left 残差 ", round(rq2, sigdigits=2), " ✓")
+    # Hurwitz の定理の実測: conj-div (ā/|a|²) が 逆元でいられる 機構は L_aᵀL_a = |a|²I
+    # (合成代数 = ノルム乗法性)。共役=転置は 全 CD 次元で 成立するが、合成性は
+    # ℝ,ℂ,ℍ,𝕆 (dim 1,2,4,8) で 尽きる — これが conj-div 門番の 正体。
+    for (M, comp) in ((2, true), (4, true), (8, true), (16, false))
+        Ah = cd_alg(M); gh = _lcg()
+        avh = rand_vec(gh, M)
+        Lh = Lmat_alg(Ah, avh)
+        Lch = Lmat_alg(Ah, vcat(avh[1], -avh[2:end]))
+        @assert maximum(abs.(Lh' .- Lch)) < 1e-12          # 共役 = 転置 (全次元)
+        d2h = maximum(abs.(Lh' * Lh .- sum(abs2, avh) .* Matrix(LinearAlgebra.I, M, M)))
+        @assert (d2h < 1e-9) == comp "Hurwitz boundary violated at cd$M"
+    end
+    println("  Hurwitz 実測: 共役=転置は全次元 ✓ ; L_aᵀL_a=|a|²I は dim 1,2,4,8 のみ",
+            " (cd16 で破れ = conj-div 門番の機構) ✓")
     # 古典の証人団 (M₂(ℂ) = mat2⟨cd2⟩): 棚の演算を 古典理論と 突き合わせる
     MC = mat_over(cd_alg(2), 2)
     _at(r, c, k) = ((c - 1) * 2 + (r - 1)) * 2 + k
