@@ -127,6 +127,42 @@ def fused_group_mul(T, a: Tot, b: Tot) -> Tot:
     return Tot(ov.reshape(shp), of.reshape(shp))
 
 
+# ---------------------------------------------------------------- TOTALIZE の 融合 (税関 1 カーネル)
+@triton.jit
+def _totalize_kernel(x_ptr, v_ptr, f_ptr, n, BLOCK: tl.constexpr,
+                     GEc: tl.constexpr, LEc: tl.constexpr, SUNKc: tl.constexpr,
+                     MAXFc: tl.constexpr, MINFc: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float64)
+    isnan = x != x
+    s = tl.where(x > 0, 1.0, tl.where(x < 0, -1.0, 0.0))
+    a = tl.abs(x)
+    over = (a > MAXFc) & (~isnan)
+    under = (a > 0) & (a < MINFc) & (~isnan)
+    val = tl.where(isnan, 0.0, tl.where(over, s * MAXFc, tl.where(under, s * MINFc, x)))
+    fl = (tl.where(isnan, GEc + LEc + SUNKc, 0) | tl.where(over, GEc, 0)
+          | tl.where(under, LEc, 0))
+    tl.store(v_ptr + offs, val.to(tl.float32), mask=mask)
+    tl.store(f_ptr + offs, fl.to(tl.uint8), mask=mask)
+
+
+def fused_totalize(x) -> Tot:
+    """Tot(x) の 融合版 (入口 全域化を 1 カーネルで)。意味論の 正は cuda_total.Tot —
+       値 float32 一致・フラグ ビット一致。獲物は 小バッチの カーネル起動 固定費
+       (未融合 Tot() は torch 小演算 ~10 個を 別々に 起動する)。"""
+    xf = x.reshape(-1).contiguous()
+    n = xf.numel()
+    v = torch.empty(n, dtype=torch.float32, device=xf.device)
+    f = torch.empty(n, dtype=torch.uint8, device=xf.device)
+    BLOCK = 1024
+    _totalize_kernel[((n + BLOCK - 1) // BLOCK,)](
+        xf, v, f, n, BLOCK=BLOCK, GEc=int(GE), LEc=int(LE), SUNKc=int(SUNK),
+        MAXFc=MAXF, MINFc=MINF)
+    return Tot(v.reshape(x.shape), f.reshape(x.shape))
+
+
 # ---------------------------------------------------------------- self-test: 影は本体と一致するか
 def self_test():
     dev = torch.device('cuda')
@@ -166,6 +202,20 @@ def self_test():
     ref, got = group_mul(T, a, b), fused_group_mul(T, a, b)
     assert int((ref.val != got.val).sum()) == 0 and int((ref.flag != got.flag).sum()) == 0
     print("  フラグなし入力でも 完全一致 ✓")
+    # TOTALIZE の 融合も 影: 敵対的バッテリ (NaN・±Inf・範囲外・非正規化・真の零・普通)
+    B = 200000
+    x = torch.randn(B, device=dev, dtype=torch.float64)
+    x[torch.rand(B, device=dev) < 0.05] = float('nan')
+    x[torch.rand(B, device=dev) < 0.05] = float('inf')
+    x[torch.rand(B, device=dev) < 0.05] = float('-inf')
+    x[torch.rand(B, device=dev) < 0.05] *= 1e300                    # f32 範囲外
+    x[torch.rand(B, device=dev) < 0.05] *= 1e-300                   # f32 未満
+    x[torch.rand(B, device=dev) < 0.10] = 0.0
+    ref, got = Tot(x), fused_totalize(x)
+    nv = int((ref.val != got.val).sum()); nf = int((ref.flag != got.flag).sum())
+    print(f"  fused_totalize: 値の不一致 {nv}/{B}  フラグの不一致 {nf}/{B}"
+          f"  {'✓ 完全一致' if nv == 0 and nf == 0 else '← 要調査'}")
+    assert nv == 0 and nf == 0
     print("★ 融合カーネル = 本体の忠実な影 (フラグ ビット一致・値 float32 一致)")
 
 
