@@ -22,8 +22,21 @@ HW_REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)
 
 
 # ================================================================ coarse (SPEC §3 唯一の新規)
-def coarse_group_mul(T, a, b):
-    """粗誠実の BILIN。値経路は evidence と 同一 (f64 蓄積 → 最後に 1 回 飽和)。
+_WIDTH = {"f64": torch.float64, "f32": torch.float32}
+
+def _raw_bilin(T, a, b, width):
+    """蓄積の 芯。width は 誠実さと 独立の **貯め幅ダイヤル** (SPEC §3 三分解):
+       f64 = quire 規律 (民生 GPU で 7.4×の 請求書) / f32 = 相対誤差 ~1e-7・7.2× 速い。
+       half (f16/bf16) は 実測で 却下 — この einsum 路では 速度 利得 0 のまま 誤差 1e-3 級。"""
+    dt = _WIDTH[width]
+    M = T.shape[0]
+    raw = torch.einsum('kij,bi,bj->bk', T.to(dt),
+                       a.val.reshape(-1, M).to(dt), b.val.reshape(-1, M).to(dt))
+    return _sat(raw.double(), a.device)
+
+
+def coarse_group_mul(T, a, b, width="f64"):
+    """粗誠実の BILIN。width='f64' なら 値経路は evidence と 同一 (bit一致)。
        フラグ: 入力の どこかに 札が あれば 出力 **全成分**に GE|LE|SUNK —
        「境界事象に 触れた・向きと 符号は 追跡していない」の 粗い 上界 (過剰警報あり・嘘なし)。
        + 出力 自身の 飽和札 (こちらは 向きつきで 正確)。
@@ -31,22 +44,16 @@ def coarse_group_mul(T, a, b):
        融合しても 買うものが ない (実測 1.13×)。"""
     M = T.shape[0]
     shp = a.val.shape
-    av = a.val.reshape(-1, M).double()
-    bv = b.val.reshape(-1, M).double()
-    raw = torch.einsum('kij,bi,bj->bk', T.double(), av, bv)
-    val, sflag = _sat(raw, a.device)
+    val, sflag = _raw_bilin(T, a, b, width)
     dirty = ((a.flag.reshape(-1, M) | b.flag.reshape(-1, M)).amax(1, keepdim=True) > 0)
     fin = dirty.to(torch.uint8) * (GE | LE | SUNK)
     return Tot(val.reshape(shp), (sflag | fin).reshape(shp))
 
 
-def bare_group_mul(T, a, b):
+def bare_group_mul(T, a, b, width="f64"):
     "値のみ (NaN 非生成は 維持・フラグは 運ばない)。両端を evidence が 守る 区間の 内側 専用。"
-    M = T.shape[0]
     shp = a.val.shape
-    raw = torch.einsum('kij,bi,bj->bk', T.double(),
-                       a.val.reshape(-1, M).double(), b.val.reshape(-1, M).double())
-    val, sflag = _sat(raw, a.device)
+    val, sflag = _raw_bilin(T, a, b, width)
     return Tot(val.reshape(shp), torch.zeros_like(sflag).reshape(shp))
 
 
@@ -83,9 +90,13 @@ class Program:
         self.ins.append(("TOTALIZE", dict(dst=dst, src=src)))
         return self
 
-    def BILIN(self, dst, a, b, alg="sedenion", honesty="evidence"):
+    def BILIN(self, dst, a, b, alg="sedenion", honesty="evidence", width="f64"):
+        "width: 貯め幅ダイヤル ('f64'=quire 規律 / 'f32'=~1e-7 誤差で 7.2× — coarse/bare のみ)"
         assert honesty in ("evidence", "coarse", "bare")
-        self.ins.append(("BILIN", dict(dst=dst, a=a, b=b, alg=alg, honesty=honesty)))
+        assert width in _WIDTH and (width == "f64" or honesty != "evidence"), \
+            "evidence は f64 固定 (bit一致 契約)"
+        self.ins.append(("BILIN", dict(dst=dst, a=a, b=b, alg=alg, honesty=honesty,
+                                       width=width)))
         return self
 
     def LINMAP(self, dst, src, map_name, honesty="bare"):
@@ -158,9 +169,9 @@ def run(prog, feed, where="cpu"):
                 else:
                     env[p["dst"]] = group_mul(T, a, b)
             elif p["honesty"] == "coarse":
-                env[p["dst"]] = coarse_group_mul(T, a, b)
+                env[p["dst"]] = coarse_group_mul(T, a, b, width=p.get("width", "f64"))
             else:
-                env[p["dst"]] = bare_group_mul(T, a, b)
+                env[p["dst"]] = bare_group_mul(T, a, b, width=p.get("width", "f64"))
         elif op == "LINMAP":
             mp = NR.amap(p["map_name"])
             M = torch.as_tensor(np.real(mp.M), dtype=torch.float64, device=dev)
@@ -226,6 +237,20 @@ def self_test():
     assert torch.all(cod.flag[3] == (GE | LE | SUNK)), "汚れ行の 全成分に 札が 立っていない"
     assert int(cod.flag[torch.arange(64) != 3].max()) == 0, "札が 他の 行へ 漏れた"
     print("   値 bit一致 ✓ / 汚れ1行 → その行の 全成分 GE|LE|SUNK・他行 0 ✓")
+
+    print("①b 貯め幅ダイヤル: coarse/bare は f32 蓄積を 選べる (evidence は f64 固定)")
+    ar = Tot(torch.randn(4096, 16, dtype=torch.float64))
+    br = Tot(torch.randn(4096, 16, dtype=torch.float64))
+    e64 = group_mul(T, ar, br)
+    c32 = coarse_group_mul(T, ar, br, width="f32")
+    rel = float((c32.val - e64.val).abs().max() / e64.val.abs().max())
+    assert 0 < rel < 1e-5, rel
+    try:
+        Program("x").BILIN("s", "a", "b", honesty="evidence", width="f32")
+        raise RuntimeError("evidence×f32 が 通ってしまった")
+    except AssertionError:
+        pass
+    print(f"   coarse(f32) vs f64: 相対差 {rel:.1e} (実測どおり ~1e-7) ✓ / evidence×f32 拒否 ✓")
 
     print("② LAWS 棚: 反証子は 走る (合格も 不合格も 測って 言う)")
     r1 = LAWS["rank_exact"]("sedenion_naive", "sedenion")
