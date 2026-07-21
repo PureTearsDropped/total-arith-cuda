@@ -87,6 +87,16 @@ def cyclic_alg(M):
             T[i, j, (i + j) % M] = 1.0
     return Alg(f"cyc{M}", np.eye(M)[0], T)
 
+def diag_alg(M):
+    """周波数代数(各点積の対角代数): e_f·e_f = e_f, それ以外 0。単位元 = 全成分 1。
+       巡回代数の Wedderburn 標準形 — DFT が 同型写像(MAPS 参照)。
+       冪等元 e_f = 理想バンドパスフィルタ・f≠g の e_f·e_g=0 = 零因子だらけ
+       (帯域の死 = デコンボリューション不良設定の 代数的正体)。"""
+    T = np.zeros((M, M, M))
+    for f in range(M):
+        T[f, f, f] = 1.0
+    return Alg(f"diag{M}", np.ones(M), T)
+
 def matn_alg(n):
     "real n×n matrices as a dim-n² algebra — associative, with zero divisors"
     return _from_mul(f"mat{n}", n * n, np.eye(n).ravel(),
@@ -286,7 +296,8 @@ class Impl:
     __slots__ = ("name", "U", "V", "W")
     def __init__(self, name, U, V, W):
         self.name = name
-        self.U, self.V, self.W = (np.asarray(m, float) for m in (U, V, W))
+        self.U, self.V, self.W = (np.asarray(m) if np.iscomplexobj(np.asarray(m))
+                                  else np.asarray(m, float) for m in (U, V, W))
     @property
     def R(self): return self.U.shape[0]
     def __repr__(self): return f"{self.name}(R={self.R})"
@@ -327,6 +338,13 @@ def _strassen_mat2():
          [-1, 1, 0, 0], [0, 0, 0, 1], [1, 0, 0, 0]]
     return Impl("strassen⟨mat2⟩", U, V, W)
 
+def _dft_impl(n):
+    """畳み込み定理を IMPLS の言葉で: 巡回畳み込みの (U,V,W) = (DFT, DFT, IDFT/n)。
+       R = n (素朴 n² からの ランク削減 — Strassen と 同じ現象・FFT は この U,V,W を
+       速く適用する butterfly 分解)。Σ_f U V W ≡ T_cyc は 虚部相殺込みで 厳密。"""
+    F = np.exp(-2j * np.pi / n) ** np.outer(np.arange(n), np.arange(n))
+    return Impl(f"dft⟨cyc{n}⟩", F, F, F.conj() / n)
+
 IMPLS = {
     "complex_naive":    lambda: naive_impl(cd_alg(2)),          # R=4
     "complex_gauss":    _gauss_cd2,                             # R=3
@@ -335,6 +353,8 @@ IMPLS = {
     "mat2_naive":       lambda: naive_impl(matn_alg(2)),        # R=8
     "mat2_strassen":    _strassen_mat2,                         # R=7
     "gauss2":           lambda: impl_kron(_gauss_cd2(), _gauss_cd2()),  # cd2⊗cd2, R=9<16
+    "cyclic8_naive":    lambda: naive_impl(cyclic_alg(8)),      # R=64
+    "cyclic8_fft":      lambda: _dft_impl(8),                   # R=8 ← 畳み込み定理
 }
 def impl(name): return IMPLS[name]()
 
@@ -343,11 +363,54 @@ def list_impls():
     targets = {"complex_naive": cd_alg(2), "complex_gauss": cd_alg(2),
                "quaternion_naive": cd_alg(4), "sedenion_naive": cd_alg(16),
                "mat2_naive": matn_alg(2), "mat2_strassen": matn_alg(2),
-               "gauss2": tensor(cd_alg(2), cd_alg(2))}
+               "gauss2": tensor(cd_alg(2), cd_alg(2)),
+               "cyclic8_naive": cyclic_alg(8), "cyclic8_fft": cyclic_alg(8)}
     print(f"{'preset':<18}{'computes':<12}{'R(乗算)':<10}exact?")
     for nm in sorted(IMPLS):
         im, tg = IMPLS[nm](), targets[nm]
         print(f"{nm:<18}{tg.name:<12}{im.R:<10}{'✓ 0.0' if impl_verify(im, tg) < 1e-12 else '✗'}")
+
+# ================================================================ MAPS: 4枚目の棚(代数間の写像)
+class AlgMap:
+    """代数間の 線形写像 M: src → dst。準同型性 M(a·b) = M(a)·M(b) は 主張でなく
+       map_verify が 測る。ALGS(何を)×OPS(どの関数)×IMPLS(どう)に 続く 4 枚目:
+       MAPS(どの代数の 言葉に 翻訳するか)。第 1 号 = DFT(時間の畳み込み代数 → 周波数の
+       各点積代数 = Wedderburn 標準形への 基底変換)。"""
+    __slots__ = ("name", "src", "dst", "M")
+    def __init__(self, name, src, dst, M):
+        self.name, self.src, self.dst = name, src, dst
+        self.M = np.asarray(M)
+    def __call__(self, a):
+        return self.M @ np.asarray(a)
+    def __repr__(self): return f"AlgMap({self.name}: {self.src.name}→{self.dst.name})"
+
+def map_verify(mp, rng=None, trials=6):
+    """準同型性の 反証: max|M(a·b) − M(a)·M(b)| と 単位元の 保存 |M(1_src) − 1_dst|。
+       ≈0 ⟺ 本物の 代数準同型(ランダム行列は ここで 落ちる — 陰性対照)。"""
+    rng = rng or np.random.default_rng(0)
+    worst = 0.0
+    for _ in range(trials):
+        a = rng.standard_normal(mp.src.dim)
+        b = rng.standard_normal(mp.src.dim)
+        lhs = mp(rawmul(mp.src, a, b))
+        rhs = rawmul(mp.dst, mp(a), mp(b))
+        worst = max(worst, float(np.abs(lhs - rhs).max()))
+    unit = float(np.abs(mp(mp.src.unit) - mp.dst.unit).max())
+    return worst, unit
+
+def _dft_map(n):
+    F = np.exp(-2j * np.pi / n) ** np.outer(np.arange(n), np.arange(n))
+    return AlgMap(f"dft{n}", cyclic_alg(n), diag_alg(n), F)
+
+def _idft_map(n):
+    F = np.exp(-2j * np.pi / n) ** np.outer(np.arange(n), np.arange(n))
+    return AlgMap(f"idft{n}", diag_alg(n), cyclic_alg(n), F.conj().T / n)
+
+MAPS = {
+    "dft8":  lambda: _dft_map(8),      # 時間→周波数 (畳み込み → 各点積)
+    "idft8": lambda: _idft_map(8),     # 周波数→時間 (逆向きも 準同型)
+}
+def amap(name): return MAPS[name]()
 
 # ================================================================ probes: measure, don't assume
 def _rand(rng, n, s=0.3): return Nel(s * rng.standard_normal(n))
@@ -485,6 +548,30 @@ def self_test():
     print(f"kron composition: gauss⊗gauss computes cd2⊗cd2 exactly with R=9 (naive 16) ✓")
     print(f"cost of exp on cd2 (order 20 = 20 products): naive {20 * impl('complex_naive').R}"
           f" mults vs gauss {20 * impl('complex_gauss').R} mults — same answer, verified same T")
+    # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
+    print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
+    fq = diag_alg(8)
+    rngm = np.random.default_rng(3)
+    assert commut_defect(fq, rngm) < 1e-9 and assoc_defect(fq, rngm) < 1e-9
+    e2 = np.eye(8)[2]
+    assert np.abs(rawmul(fq, e2, e2) - e2).max() < 1e-12          # 冪等 e_f²=e_f
+    assert np.abs(rawmul(fq, e2, np.eye(8)[5])).max() < 1e-12     # 零因子 e_f·e_g=0
+    dft = amap("dft8"); idft = amap("idft8")
+    hom, unit = map_verify(dft, rngm)
+    assert hom < 1e-12 and unit < 1e-12                            # DFT(e0)=全1=freqの単位元
+    hom2, unit2 = map_verify(idft, rngm)
+    assert hom2 < 1e-12 and unit2 < 1e-12
+    a8 = rngm.standard_normal(8)
+    assert np.abs(np.real(idft(dft(a8))) - a8).max() < 1e-12       # 逆写像
+    rnd = AlgMap("random", cyclic_alg(8), diag_alg(8), rngm.standard_normal((8, 8)))
+    homr, _ = map_verify(rnd, rngm)
+    assert homr > 1e-2                                             # 陰性対照: 見抜ける
+    imf = impl("cyclic8_fft")
+    assert impl_verify(imf, cyclic_alg(8)) < 1e-12 and imf.R == 8  # 畳み込み定理=R=n
+    xa, xb = rngm.standard_normal(8), rngm.standard_normal(8)
+    assert np.abs(np.real(impl_mul(imf, xa, xb)) - rawmul(cyclic_alg(8), xa, xb)).max() < 1e-10
+    print("  freq代数: 冪等✓ 零因子✓ / DFT・IDFT: 準同型+単位元+可逆 ✓ /")
+    print("  ランダム行列は準同型でないと検出 ✓ / 畳み込み定理: ΣUVW≡T_cyc・R=64→8 ✓")
     # totality
     bad = nel(cd_alg(16), [np.nan] + [1e308] * 15)
     assert (bad.flag & SING) and np.isfinite(nexp(cd_alg(16), bad).c).all()
