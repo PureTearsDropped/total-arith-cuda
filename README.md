@@ -208,7 +208,14 @@ filters, zero divisors everywhere = dead bands — deconvolution's ill-posedness
 and the **convolution theorem joins IMPLS** (`cyclic8_fft`: (U,V,W)=(DFT,DFT,IDFT/n), rank
 R=64→8, `ΣUVW≡T` exact — FFT proper is the butterfly factorization for applying these
 matrices fast). DSP dictionary: filter=multiply, bandpass=idempotent, dead band=zero
-divisor, deconvolution=solve with SING naming the lost frequencies.
+divisor, deconvolution=solve with SING naming the lost frequencies. **Walsh–Hadamard joins
+as the XOR-group's DFT** (user's recall): `xor_alg(n)` (the untwisted-CD group algebra —
+this fabric's native wiring, all characters real ±1) is diagonalized by WH with `ΣUVW≡T`
+**exactly 0.0** and rank R=n — beating cyclic Winograd's 2n−t=12 at n=8 with R=8, transforms
+that are pure add/sub wiring (zero multipliers), measured precision amplification 0.94×
+(better than naive), and **bit-exact end-to-end on integer inputs** (±1 transforms + /8
+exponent shift). Honest scope: XOR-convolution is dyadic-shift-invariant filtering, not
+time-shift FIR — same phenomenon, different group.
 
 Third shelf **`IMPLS`**: bilinear ALGORITHMS in (U,V,W) normal form — same structure tensor T, different implementations (complex: naive R=4 vs Gauss R=3; 2×2 matmul: naive R=8 vs Strassen R=7; sedenion naive R=256); correctness is the tensor equation `Σ_r U⊗V⊗W ≡ T`, checked to 0.0, and algorithms COMPOSE by Kronecker product mirroring `tensor()` (gauss⊗gauss computes cd2⊗cd2 with R=9 < naive 16). Probes measure every combination; measured laws asserted in
 `python nested_registry.py`: exp∘log ⟺ power-associativity; ⊗-partner must be
