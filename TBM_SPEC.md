@@ -89,7 +89,7 @@ c = Wᵀ((U·a) ⊙ (V·b))        (⊙ は成分ごとの積・R = 実乗算の
 
 | 命令 × honesty | CPU (nested_registry / ScalarTot.jl) | GPU (Triton) | HW (rtl/ 自動生成SV) |
 |---|---|---|---|
-| TOTALIZE | ✅ `Tot()` / `TotNum` | ✅ (入口 clamp) | ✅ 入口全域化 |
+| TOTALIZE | ✅ `Tot()` / `TotNum` | ✅ 融合 `fused_totalize` (Tot と bit一致・未融合比 7–11×) | ✅ 入口全域化 |
 | BILIN bare | ✅ rawmul / `tbm.bare_group_mul` | ✅ `cuda_fused_pipeline` | — |
 | BILIN coarse | ✅ `tbm.coarse_group_mul` | ✅ 同左 (非融合 einsum = 大バッチ最適・1.13×) | — |
 | BILIN evidence | ✅ group_mul | ✅ `cuda_fused` (フラグbit一致契約) | ✅ `sd_mult10` (状態7ゲート/成分) |

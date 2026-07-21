@@ -142,8 +142,12 @@ def run(prog, feed, where="cpu"):
     env = {}
     for op, p in prog.ins:
         if op == "TOTALIZE":
-            env[p["dst"]] = Tot(torch.as_tensor(np.asarray(feed[p["src"]], dtype=np.float64),
-                                                device=dev))
+            x = torch.as_tensor(np.asarray(feed[p["src"]], dtype=np.float64), device=dev)
+            if where == "gpu":
+                from cuda_fused import fused_totalize
+                env[p["dst"]] = fused_totalize(x)              # 税関 1 カーネル (Tot と bit一致)
+            else:
+                env[p["dst"]] = Tot(x)
         elif op == "BILIN":
             T = _wiring(p["alg"], dev)
             a, b = env[p["a"]], env[p["b"]]
