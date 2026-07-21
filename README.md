@@ -198,7 +198,19 @@ algebra is a structure tensor `T[i,j,k]` (product = one einsum; `jordan`/`lie` =
 symmetrize/antisymmetrize T). Twin preset shelves: **`ALGS`** (13 named algebras incl.
 Grassmann Λn — Λ1 = dual numbers ⇒ forward-mode AD `f(a+ε)=f(a)+f′(a)ε`; Clifford;
 `dualquat` = Λ1⊗ℍ rigid-body pose) × **`OPS`** (`nop(A,'sqrt',x)` — forward vs
-candidate+verify). Third shelf **`IMPLS`**: bilinear ALGORITHMS in (U,V,W) normal form — same structure tensor T, different implementations (complex: naive R=4 vs Gauss R=3; 2×2 matmul: naive R=8 vs Strassen R=7; sedenion naive R=256); correctness is the tensor equation `Σ_r U⊗V⊗W ≡ T`, checked to 0.0, and algorithms COMPOSE by Kronecker product mirroring `tensor()` (gauss⊗gauss computes cd2⊗cd2 with R=9 < naive 16). Probes measure every combination; measured laws asserted in
+candidate+verify). Fourth shelf **`MAPS`** — maps BETWEEN algebras, homomorphy measured not claimed:
+`AlgMap` + `map_verify` (falsifies `M(a·b)=M(a)·M(b)` and unit preservation; a random matrix
+is caught as a non-homomorphism — negative control asserted). First citizens: **DFT** (the
+time-domain convolution algebra `cyc8` → the frequency algebra `diag8` = its Wedderburn
+normal form) and IDFT, both verified homomorphic, unit-preserving (`DFT(δ)=all-ones`) and
+mutually inverse. The frequency algebra joins ALGS (`diag_alg`: idempotents = ideal bandpass
+filters, zero divisors everywhere = dead bands — deconvolution's ill-posedness as algebra),
+and the **convolution theorem joins IMPLS** (`cyclic8_fft`: (U,V,W)=(DFT,DFT,IDFT/n), rank
+R=64→8, `ΣUVW≡T` exact — FFT proper is the butterfly factorization for applying these
+matrices fast). DSP dictionary: filter=multiply, bandpass=idempotent, dead band=zero
+divisor, deconvolution=solve with SING naming the lost frequencies.
+
+Third shelf **`IMPLS`**: bilinear ALGORITHMS in (U,V,W) normal form — same structure tensor T, different implementations (complex: naive R=4 vs Gauss R=3; 2×2 matmul: naive R=8 vs Strassen R=7; sedenion naive R=256); correctness is the tensor equation `Σ_r U⊗V⊗W ≡ T`, checked to 0.0, and algorithms COMPOSE by Kronecker product mirroring `tensor()` (gauss⊗gauss computes cd2⊗cd2 with R=9 < naive 16). Probes measure every combination; measured laws asserted in
 `python nested_registry.py`: exp∘log ⟺ power-associativity; ⊗-partner must be
 commutative AND associative; BCH repairs at s⁴ through octonions (Artin) and s³ at
 sedenions; Jacobi breaks at octonions.
