@@ -113,9 +113,13 @@ def _wh_matrix(n):
 
 def _cwh_matrix():
     """複素WH (Chrestenson-4) = F₄⊗H₂: 成分 {±1,±i} のみ。×i = 実虚スワップ+符号 = 配線。
-       ℤ/4×ℤ/2 の指標変換 — 「タダの変換」の上限(指標がガウス整数の単数に収まる限界)。
-       位数8のアーベル群の実ランク階段: (ℤ/2)³:8 / ℤ/4×ℤ/2:10 / ℤ/8:12 (=2n−t) —
-       巡回性1段ごとに+2・ℤ/8で√2が現れて変換が初めて有料化(m値法則の変換版)。"""
+       ℤ/4×ℤ/2 の指標変換 — 「厳密かつ乗算器ゼロの直接実装」の上限
+       (指標がガウス整数の単数{±1,±i}に収まる限界。√2係数も定数乗算器/シフト加算で
+       安くはできる — 絶対の壁でなく「厳密・無料」の壁)。
+       位数8のアーベル群の実ランク階段(外部監査 2026-07-21 で ℤ/8 を訂正):
+         (ℤ/2)³: ℝ⁸ (t=8) → 8 / ℤ/4×ℤ/2: ℝ⁴⊕ℂ² (t=6) → 10 / ℤ/8: ℝ²⊕ℂ³ (t=5) → 11
+       (ℤ/8 は 実指標が k=0,4 の 2個+複素対3組。係数を有理数に制限すると x⁸−1 の
+        ℚ分解 t=4 → 12 = √2 を厳密に持てない機械の値段)。"""
     F4 = np.array([[1,1,1,1],[1,-1j,-1,1j],[1,-1,1,-1],[1,1j,-1,-1j]])
     H2 = np.array([[1,1],[1,-1]], dtype=complex)
     return np.kron(F4, H2)
@@ -383,7 +387,26 @@ IMPLS = {
                                      _wh_matrix(8) / 8),        # R=8・U,V,Wは±1のみ・厳密
     "z4z2_cwh":         lambda: Impl("cwh⟨z4z2⟩", _cwh_matrix(), _cwh_matrix(),
                                      _cwh_matrix().conj() / 8), # R=8複素・{±1,±i}=乗算器ゼロ
+    "z4z2_rank10":      lambda: _z4z2_rank10_impl(),            # ★実R=10(共役圧縮+Gauss)
 }
+
+def _z4z2_rank10_impl():
+    """実ランク10の 明示的 (U,V,W) — 外部監査の指摘「8複素積のままでは 10 実乗算の
+       実装ではない」への 回答。共役対称で スペクトルを 実4チャネル+複素2チャネルに 圧縮し、
+       複素積は Gauss 3実乗算: 4 + 2·3 = 10 = 2n−t (ℝ⁴⊕ℂ², t=6)。U,V は 実(±1と和差のみ)、
+       W は 1/8 の 有理係数 — 整数入力で 全段厳密。"""
+    C = _cwh_matrix()
+    RE, CX = [0, 1, 4, 5], [2, 3]
+    rows = [C[r].real for r in RE]
+    for r in CX:
+        xr, xi = C[r].real, C[r].imag
+        rows += [xr, xi, xr + xi]                 # Gauss の 3 つの 線形結合
+    U = np.array(rows)
+    Tt = tensor(cyclic_alg(4), cyclic_alg(2)).T
+    Mm = np.einsum('ri,rj->ijr', U, U).reshape(64, 10)
+    Wm = np.linalg.lstsq(Mm, Tt.reshape(64, 8), rcond=None)[0]
+    Wm = np.round(Wm * 16) / 16                   # 有理係数に スナップ(厳密性は verify が担保)
+    return Impl("rank10⟨z4z2⟩", U, U, Wm)
 def impl(name): return IMPLS[name]()
 
 def list_impls():
@@ -394,7 +417,8 @@ def list_impls():
                "gauss2": tensor(cd_alg(2), cd_alg(2)),
                "cyclic8_naive": cyclic_alg(8), "cyclic8_fft": cyclic_alg(8),
                "xor8_naive": xor_alg(8), "xor8_wh": xor_alg(8),
-               "z4z2_cwh": tensor(cyclic_alg(4), cyclic_alg(2))}
+               "z4z2_cwh": tensor(cyclic_alg(4), cyclic_alg(2)),
+               "z4z2_rank10": tensor(cyclic_alg(4), cyclic_alg(2))}
     print(f"{'preset':<18}{'computes':<12}{'R(乗算)':<10}exact?")
     for nm in sorted(IMPLS):
         im, tg = IMPLS[nm](), targets[nm]
@@ -630,7 +654,14 @@ def self_test():
         got = np.real(impl_mul(imc, Ai2[i], Bi2[i]))
         assert np.abs(got - rawmul(z42, Ai2[i], Bi2[i])).max() == 0.0
     print("  複素WH=ℤ/4×ℤ/2のDFT({±1,±i}=×iはスワップ=タダ): 準同型✓ ΣUVW厳密0✓ 整数厳密✓")
-    print("  実ランク階段(位数8): (ℤ/2)³:8 / ℤ/4×ℤ/2:10 / ℤ/8:12 — √2出現(m=8)で変換が有料化")
+    # ★実ランク10の明示的(U,V,W) — 「8複素積では10実乗算の実装でない」(外部監査)への回答
+    im10 = impl("z4z2_rank10")
+    assert im10.R == 10 and impl_verify(im10, z42) < 1e-13
+    for i in range(100):
+        got = impl_mul(im10, Ai2[i], Bi2[i])
+        assert np.abs(got - rawmul(z42, Ai2[i], Bi2[i])).max() == 0.0
+    print("  実ランク10実装: R=10ちょうど・ΣUVW≡T✓・整数入力厳密✓ (=2n−t, ℝ⁴⊕ℂ²)")
+    print("  実ランク階段(位数8, ℤ/8はℝ²⊕ℂ³に訂正): 8 / 10 / 11 (有理係数制限なら ℤ/8=12)")
     # totality
     bad = nel(cd_alg(16), [np.nan] + [1e308] * 15)
     assert (bad.flag & SING) and np.isfinite(nexp(cd_alg(16), bad).c).all()

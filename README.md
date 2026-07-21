@@ -211,11 +211,21 @@ matrices fast). DSP dictionary: filter=multiply, bandpass=idempotent, dead band=
 divisor, deconvolution=solve with SING naming the lost frequencies. **Walsh–Hadamard joins
 as the XOR-group's DFT** (user's recall): `xor_alg(n)` (the untwisted-CD group algebra —
 this fabric's native wiring, all characters real ±1) is diagonalized by WH with `ΣUVW≡T`
-**exactly 0.0** and rank R=n — beating cyclic Winograd's 2n−t=12 at n=8 with R=8, transforms
+**exactly 0.0** and rank R=n — beating cyclic ℤ/8's real rank 11 at n=8 with R=8, transforms
 that are pure add/sub wiring (zero multipliers), measured precision amplification 0.94×
 (better than naive), and **bit-exact end-to-end on integer inputs** (±1 transforms + /8
-exponent shift). Honest scope: XOR-convolution is dyadic-shift-invariant filtering, not
-time-shift FIR — same phenomenon, different group.
+exponent shift). **Complex Walsh–Hadamard** (Chrestenson-4, `z4z2` = `tensor(cyc4,cyc2)`) extends the free
+zone: entries {±1,±i} (×i = swap+negate = wiring), exact ΣUVW≡T, and the review-corrected
+real-rank ladder of the three abelian groups of order 8 — `(ℤ/2)³`: ℝ⁸→8, `ℤ/4×ℤ/2`:
+ℝ⁴⊕ℂ²→10, `ℤ/8`: ℝ²⊕ℂ³→**11** (12 only if constants are restricted to rationals — the
+price of a machine that cannot hold √2 exactly). The rank-10 claim is IMPLEMENTED, not just
+derived: `z4z2_rank10` compresses the spectrum by conjugate symmetry (4 real + 2 complex
+channels, Gauss 3-mult each), a multiplication counter proves exactly 10 real multiplies per
+product, `ΣUVW≡T` verified, and integer inputs stay end-to-end bit-exact. Honest scope:
+XOR/quaternary convolutions are dyadic-shift-invariant filtering, not time-shift FIR — same
+phenomenon, different groups; and the {±1,±i} boundary marks "exact and free", not
+"impossible beyond" (√2 constants can be made cheap via constant multipliers/shift-add,
+just not free-and-exact).
 
 Third shelf **`IMPLS`**: bilinear ALGORITHMS in (U,V,W) normal form — same structure tensor T, different implementations (complex: naive R=4 vs Gauss R=3; 2×2 matmul: naive R=8 vs Strassen R=7; sedenion naive R=256); correctness is the tensor equation `Σ_r U⊗V⊗W ≡ T`, checked to 0.0, and algorithms COMPOSE by Kronecker product mirroring `tensor()` (gauss⊗gauss computes cd2⊗cd2 with R=9 < naive 16). Probes measure every combination; measured laws asserted in
 `python nested_registry.py`: exp∘log ⟺ power-associativity; ⊗-partner must be
