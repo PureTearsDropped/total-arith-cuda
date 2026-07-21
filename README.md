@@ -24,6 +24,25 @@ The GPU "height" of a wider project on **total arithmetic** and **"wiring = comp
 
 **Honest caveat.** The flags mark *totalization events only* (saturation to `±MAX`/`ε`, division by zero). Ordinary float32 round-to-nearest is **not** flagged, because nearest rounding has no direction and cannot be turned into a one-sided bound. (Measured: the 320,019 cases that differ from the float64 truth with no flag are all explained by float32 nearest rounding; zero saturation-flag lies.)
 
+## The Total Bilinear Machine (TBM) — one multiply instruction, three silicons
+
+The pieces of this project assemble into **one machine** ([TBM_SPEC.md](TBM_SPEC.md)): a
+computer whose only multiplying instruction is the totalized bilinear contraction
+`c = Wᵀ((U·a)⊙(V·b))` over `(val, flag)` operands. Six instructions total
+(TOTALIZE / BILIN / LINMAP / AXPY / NORM / CHECK); everything else — exp, solve, FFT
+convolution, law discovery — is a *program* (macro), and that smallness is the point.
+Every instruction carries an **honesty dial** (`evidence` / `coarse` / `bare`), because the
+cost of honesty is graded, not flat (measured: evidence is *free* at control-loop batch
+sizes, 37× at bulk; coarse is 1.13× ≈ free at bulk — so forensic flags at the boundary,
+coarse flags inside is *optimal*, not a compromise). `tbm.py` is the assembler (a thin
+layer: all semantics live in the audited modules it calls); `run_everywhere.py` is the
+conformance test — **the same program runs on CPU (torch), GPU (fused Triton), and
+auto-generated SystemVerilog gates (iverilog RTL simulation, 48,222-gate sedenion
+components), with bit-identical values and bit-identical flags, adversarial Inf/NaN
+injection included** (passed 2026-07-21).
+
+*Compile once, run on three silicons, never lie.*
+
 ### Reproduce
 
 ```bash
@@ -136,6 +155,21 @@ cd16, flagged): the legacy flagged path has a batch-independent ~36ms floor (per
 (582×)**, B=1024: 387×, B=16k: 32×, B=1M: parity. Large-batch clean inputs stay faster on
 the existing einsum path (memory-optimal there). The win is exactly the control-loop /
 per-sample regime — a 1 kHz attitude loop fits in 63µs, not in 36ms.
+
+### `cuda_fused_pipeline.py` — the M/N/O × (U,V,W) fused-kernel compiler
+
+The generalization of the hand-written fused kernels: **one Triton kernel source**,
+specialized per shelf configuration via `constexpr` (dead branches eliminated at JIT).
+`compile_pipeline(impl, program, tape...)` takes any IMPLS citizen (N + U/V/W; R zero-padded
+to a power of two), applies it implicitly (M — no L materialized), and runs the O-layer
+program (product, or series = tape × chained bilinears + scaling + squarings — the
+gate_series skeleton on GPU) entirely in registers, one HBM round trip. Verified: the same
+source specializes to R=3 (Gauss) … R=256 (sedenion naive) products and to exp/sin tapes
+(vs float64 references, ~1e-7). Measured honestly: the fusion dividend depends on rank —
+sedenion R=256 series is compute-bound (fusion 1.0×, stated), while **xor8×WH (R=8) series
+gets 5.0× (277M exp/s): low-rank IMPLS × fused O-program is a compounding product of the
+two dials**. Flag-semantics fusion remains with `cuda_fused`/`cuda_fused_solve`; this module
+is the generality demonstration (values, v1).
 
 ### `cuda_fused_solve.py` — the solve family as one fused kernel
 
@@ -286,6 +320,8 @@ an issue reporting the result (either way) is welcome.
 - **広く貯めて最後に1回丸め**。群積/MACはfloat64で貯めて最後に一度だけ飽和（＝positの*quire*と同じ規律）。
 
 **正直な但し書き**: フラグは*全域化イベントのみ*（`±MAX`/`ε`飽和・0除算）。float32の最近接丸めはフラグしない（方向を持たず片側境界にできないため）。
+
+**総ビリニア機械（TBM）**: 本リポの部品は1つの機械に組み上がる（[TBM_SPEC.md](TBM_SPEC.md)）。掛け算する命令は `Wᵀ((U·a)⊙(V·b))` ただ1つ・全6命令、exp/solve/FFT/法則発見は全部「プログラム（マクロ）」。全命令が誠実さのダイヤル（証拠級/粗/裸）を持つ——誠実さの税金は一枚岩でなく傾斜だから（実測: 証拠級は制御ループ帯でタダ・大バッチ37×、粗は1.13×≒タダ）。`tbm.py` がアセンブラ、`run_everywhere.py` が適合試験で、**同じプログラムが CPU / GPU（融合Triton）/ 自動生成SystemVerilogゲート（RTLシミュ）で値・フラグともbit一致**（敵対的Inf/NaN注入込み・2026-07-21合格）。*Compile once, run on three silicons, never lie.*
 
 ### 再現方法
 
