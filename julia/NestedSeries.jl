@@ -719,6 +719,27 @@ function self_test()
     _, rq2, _ = nsolve_left(DQs, aq, xq)
     @assert rq2 < 1e-8
     println("  棚の他代数 (dualquat): nsolve_left 残差 ", round(rq2, sigdigits=2), " ✓")
+    # 古典の証人団 (M₂(ℂ) = mat2⟨cd2⟩): 棚の演算を 古典理論と 突き合わせる
+    MC = mat_over(cd_alg(2), 2)
+    _at(r, c, k) = ((c - 1) * 2 + (r - 1)) * 2 + k
+    _tocplx(v) = [complex(v[_at(r, c, 1)], v[_at(r, c, 2)]) for r in 1:2, c in 1:2]
+    gc2 = _lcg()
+    Ael = Nel(0.4 .* rand_vec(gc2, 8), 0x00)
+    Em = _tocplx(coeffs(nexp(MC, Ael))); Am = _tocplx(coeffs(Ael))
+    @assert abs(LinearAlgebra.det(Em) - exp(Am[1,1] + Am[2,2])) < 1e-10   # det∘exp = exp∘tr
+    u2 = [complex(1.0, 0.5), complex(-0.3, 0.8)]; v2 = [complex(0.6, -0.2), complex(0.9, 0.4)]
+    Acm = u2 * v2'                                          # rank-1 = 行列世界の日常的な零因子
+    av = zeros(8)
+    for r in 1:2, c in 1:2
+        av[_at(r, c, 1)] = real(Acm[r, c]); av[_at(r, c, 2)] = imag(Acm[r, c])
+    end
+    xel = Nel(0.5 .* rand_vec(gc2, 8), 0x00)
+    yel, _, rn2 = nsolve_left(MC, Nel(av, 0x00), xel)
+    @assert rn2 < 1e-8 && (flagof(yel) & SING) != 0
+    dcross = maximum(abs.(_tocplx(coeffs(yel)) .- LinearAlgebra.pinv(Acm) * _tocplx(coeffs(xel))))
+    @assert dcross < 1e-6                                   # 実正則表現のpinv ≡ 複素の共役転置pinv
+    println("  古典の証人団 (M₂(ℂ)): det∘exp=exp∘tr ✓ ; 特異solve ≡ 複素pinv (",
+            round(dcross, sigdigits=2), ") ✓")
     # tape user-extensibility: a custom tape (Bessel-ish) runs on any Alg unchanged
     j0 = series(cd_alg(4), Nel(0.3 .* rand_vec(g, 4), 0x00),
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
