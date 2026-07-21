@@ -158,32 +158,81 @@ def self_test():
 
 
 def benchmark():
-    import time
+    """厳密計測 (外部レビュー 2026-07-21 の 指摘を 実装):
+       CUDA イベント計測・ウォームアップ 5 回・中央値 + [p10, p90]・同期は 計測区間の 外。
+       計測対象は solve 本体のみ (入力生成・Tot 化・フラグ初期化は 区間外 — 併記)。
+       環境: GPU 機種は 実行時に 印字・fp32 (tl.dot ieee)・K=25 固定。コンパイルは
+       ウォームアップで 除外。"""
+    import numpy as np
     dev = torch.device('cuda')
     torch.manual_seed(0)
     T = wiring_tensor('cd', 16, dev)
+    print(f"\nGPU: {torch.cuda.get_device_name(0)} / fp32(ieee) / K=25 / 計測=solve本体のみ")
 
-    def bench(fn, n):
-        fn(); torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(n): fn()
+    def bench(fn, n_rep):
+        for _ in range(5): fn()                            # ウォームアップ(コンパイル込み)
         torch.cuda.synchronize()
-        return (time.time() - t0) / n
+        ts = []
+        for _ in range(n_rep):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record(); fn(); e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1))                 # ms
+        a = np.array(ts)
+        return np.median(a), np.quantile(a, 0.1), np.quantile(a, 0.9)
 
-    print(f"\n{'B':>9} {'pinv(torch)':>12} {'非融合BI':>12} {'融合':>12} {'vs pinv':>8} {'vs 非融合':>9}")
+    hdr = f"{'B':>9} {'pinv(torch)':>16} {'非融合BI':>16} {'融合':>16} {'vs pinv':>8} {'vs 非融合':>9}"
+    print(hdr)
     for B in (64, 1024, 16384, 262144, 1000000):
         av = torch.randn(B, 16, device=dev, dtype=torch.float64)
         xv = torch.randn(B, 16, device=dev, dtype=torch.float64)
+        at, xt = Tot(av), Tot(xv)                          # 入口は 計測区間の 外
         a32 = av.float(); x32 = xv.float()
         L32 = torch.einsum('kij,bi->bkj', T, a32)
-        n = 20 if B <= 16384 else 3
-        t_pinv = bench(lambda: torch.bmm(torch.linalg.pinv(L32), x32[..., None]), max(n // 2, 2))
-        t_unf = bench(lambda: unfused_solve(T, a32), n)
-        t_fus = bench(lambda: fused_solve(T, av, xv), n)
-        print(f"{B:>9,} {t_pinv*1e3:>10.2f}ms {t_unf*1e3:>10.2f}ms {t_fus*1e3:>10.2f}ms"
-              f" {t_pinv/t_fus:>7.1f}倍 {t_unf/t_fus:>8.1f}倍")
+        n = 30 if B <= 16384 else 10
+        p_m, p_l, p_h = bench(lambda: torch.bmm(torch.linalg.pinv(L32), x32[..., None]), n)
+        u_m, u_l, u_h = bench(lambda: unfused_solve(T, a32), n)
+        f_m, f_l, f_h = bench(lambda: fused_solve(T, at, xt), n)
+        print(f"{B:>9,} {p_m:>8.2f}[{p_l:.2f},{p_h:.2f}] {u_m:>8.2f}[{u_l:.2f},{u_h:.2f}]"
+              f" {f_m:>8.2f}[{f_l:.2f},{f_h:.2f}] {p_m/f_m:>7.1f}倍 {u_m/f_m:>8.1f}倍")
+    print("(表示: 中央値[p10,p90] ms)")
+
+
+def quality_report():
+    """二層検算の 品質分布 (外部レビューの 指摘②): 相対残差
+         r1 = ‖Ay−x‖/(‖x‖+ε)           … 前向き(厳密解の 主張)
+         r2 = ‖Aᵀ(Ay−x)‖/(‖A‖‖Ay−x‖+ε) … 正規方程式(最小二乗の 主張)
+       を フラグ階級別に 最大値・中央値・p99.9 で。フラグの 主張が 分布として 裏づくかの 検査。"""
+    import numpy as np
+    dev = torch.device('cuda')
+    torch.manual_seed(1)
+    T = wiring_tensor('cd', 16, dev)
+    B = 200_000
+    av = torch.randn(B, 16, device=dev, dtype=torch.float64)
+    xv = torch.randn(B, 16, device=dev, dtype=torch.float64)
+    zi = torch.arange(0, B, 4)                             # 25% を 零因子に
+    av[zi] = 0.0; av[zi, 3] = 1.0; av[zi, 10] = 1.0
+    y = fused_solve(T, av, xv)
+    L = torch.einsum('kij,bi->bkj', T.double(), av)
+    res = (L @ y.val.double()[..., None])[..., 0] - xv
+    r1 = res.norm(dim=1) / (xv.norm(dim=1) + 1e-30)
+    nr = (L.transpose(1, 2) @ res[..., None])[..., 0]
+    r2 = nr.norm(dim=1) / (L.flatten(1).norm(dim=1) * res.norm(dim=1) + 1e-30)
+    clean = (y.flag.amax(dim=1) == 0)
+    sing = ~clean
+    def stats(v):
+        a = v.cpu().numpy()
+        return f"max {a.max():.1e} / 中央値 {np.median(a):.1e} / p99.9 {np.quantile(a, 0.999):.1e}"
+    print(f"\n品質分布 (B={B:,}, 零因子25%):")
+    print(f"  clean({int(clean.sum()):,}件) の r1(前向き):   ", stats(r1[clean]))
+    print(f"  SING ({int(sing.sum()):,}件) の r2(正規方程式): ", stats(r2[sing]))
+    print(f"  SING の r1 (解なしの 正直な 大きさ):        ", stats(r1[sing]))
+    assert float(r1[clean].max()) < 1e-3 and float(r2[sing].max()) < 1e-3
+    print("  ★フラグの主張は 分布の 裾(p99.9・max)まで 裏づけられた")
 
 
 if __name__ == "__main__":
     self_test()
     benchmark()
+    quality_report()

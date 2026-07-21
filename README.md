@@ -145,8 +145,16 @@ only), `y=X·x`, AND the two-tier verification (forward residual → exact / nor
 least-squares SING / neither → SING|INEXACT) all stay in registers — one launch, one HBM
 round trip, `tl.dot(..., input_precision="ieee")` (no silent tf32). Semantics two-witnessed
 against `torch.linalg.pinv(float64)`: regulars 3.1e-7, zero-divisor least-squares 5.5e-8,
-flags honest, NaN poison propagated. Measured (RTX 5090, cd16): **B=1M: 27× vs batched
-`pinv`, 19× vs unfused Ben-Israel — 53.5M solves/s**; small batches are launch-bound (1.7×).
+flags honest, NaN poison propagated. Measured rigorously (RTX 5090, cd16, CUDA-event
+timing, 5-run warmup, median[p10,p90], solve-body only — entry totalization outside the
+timed region): **13–35× vs batched `pinv` at every batch size** (B=64: 0.07ms = 13×;
+B=1M: 14.8ms = 34× = 67.4M solves/s), 15–24× vs unfused Ben-Israel. An earlier wall-clock
+benchmark undersold small batches (0.5×) — the artifact was Tot conversion inside the timed
+loop; the review-driven rigor upgrade REVERSED that finding. `quality_report()` backs the
+flags to the distribution tails (B=200k, 25% zero divisors): clean elements' forward
+residual max 2.4e-6 (p99.9 6.6e-7); SING elements' normal-equation residual max 3.6e-7
+while their forward residual is honestly O(1) — the two-tier verification works as quality
+assurance, not decoration.
 Julia CPU twin: `nsolve_batch` in `julia/NestedSeries.jl` (allocation-free single pass,
 2.3× vs the naive loop, 0.08M solves/s single-threaded ≈ single-core BLAS floor; values and
 flags match the sequential `nsolve_left` to 2.2e-15).
