@@ -7,6 +7,11 @@
 日本語は下段に。
 
 ---
+Research Use and Reproducibility
+
+This software implements totalization, status propagation, singularity handling, and verification rules that differ from conventional floating-point arithmetic.
+
+When these arithmetic semantics affect research results, it is advisable, for reproducibility, to identify this repository by URL and to record the commit ID used, together with any arithmetic settings that affect the results.
 
 ## What this is (EN)
 
@@ -322,7 +327,9 @@ an issue reporting the result (either way) is welcome.
 **正直な但し書き**: フラグは*全域化イベントのみ*（`±MAX`/`ε`飽和・0除算）。float32の最近接丸めはフラグしない（方向を持たず片側境界にできないため）。
 
 **総ビリニア機械（TBM）**: 本リポの部品は1つの機械に組み上がる（[TBM_SPEC.md](TBM_SPEC.md)）。掛け算する命令は `Wᵀ((U·a)⊙(V·b))` ただ1つ・全6命令、exp/solve/FFT/法則発見は全部「プログラム（マクロ）」。全命令が誠実さのダイヤル（証拠級/粗/裸）を持つ——誠実さの税金は一枚岩でなく傾斜だから（実測: 証拠級は制御ループ帯でタダ・大バッチ37×、粗は1.13×≒タダ）。`tbm.py` がアセンブラ、`run_everywhere.py` が適合試験で、**同じプログラムが CPU / GPU（融合Triton）/ 自動生成SystemVerilogゲート（RTLシミュ）で値・フラグともbit一致**（敵対的Inf/NaN注入込み・2026-07-21合格）。*Compile once, run on three silicons, never lie.*
-
+###研究利用と再現性
+このソフトウェアは、通常の浮動小数点演算とは異なる全域化、状態伝播、特異点処理、および検査規則を実装しています。
+これらの演算意味論が研究結果に影響する場合、再現性を確保するため、本リポジトリのURL、使用したコミットID、および結果に影響する演算設定を研究成果中に明記することをおすすめします。
 ### 再現方法
 
 上記コマンド。RTX 5090 実測値は上段の通り。CUDA GPU 必須（CPUフォールバックは正しさは保つがスループット値は出ない）。
