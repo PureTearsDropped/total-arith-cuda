@@ -89,3 +89,22 @@ a period, negative powers not swapping GE↔LE). All fixed under one principle �
 the true value may leave ℝ)* — and a permanent **semantic oracle** now enumerates admissible
 true values per flagged input and falsifies every output claim: `julia audit_flags.jl` →
 3039 checks, 0 violations.
+
+## `generic_mlp.jl` — the same MLP code over Float64 ⇄ ComplexF64
+
+One MLP, generic over the element type; the backward pass is hand-written in Wirtinger
+form (gradient `g = 2·∂L/∂conj` — `conj`/adjoint are identities for real types, so **one
+code serves both fields**), finite-difference-checked in both Re and Im directions
+(worst 4.6e-10). Measured on ℤ/16 composition (8 seeds, median/worst):
+
+| frac | real MLP | complex MLP | real ⊙ | complex ⊙ |
+|---|---|---|---|---|
+| 0.3 | 0.000 | 0.006 | 0.391 | **0.983**/0.922 |
+| 0.5 | 0.000 | 0.008 | 0.359 | **1.000/1.000** |
+
+Swapping the number type alone buys **nothing** (a complex MLP is just a weight-tied real
+MLP). Putting complex **multiplication at the site the task needs it** — an elementwise-
+product composer `h = x⊙y`, embeddings free — solves the task outright: the free complex
+embeddings discover the 16th-roots-of-unity characters and generalize perfectly, while
+the real ⊙ arm saturates near 0.39 (real characters can only reach ±1). The number type
+matters only through the multiplication site — the ledger law, again.
