@@ -172,6 +172,8 @@ def wiring_tensor(kind, M, device):
                 T[(i + j) % M, i, j] = 1.0
     else:
         raise ValueError(kind)
+    # 配線正規形の門番 (TBM_SPEC §1.5): 三値なら配線段に係数丸めが無い＝厳密
+    assert set(torch.unique(T).tolist()) <= {-1.0, 0.0, 1.0}, f"三値正規形 破れ: {kind}"
     return T
 
 def group_mul(T, a, b):
