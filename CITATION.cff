@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below (see also the Research Use and Reproducibility section of the README: please record the commit ID and any arithmetic settings that affect results)."
+type: software
+title: "total-arith-cuda: total arithmetic on the GPU with a swappable structure tensor"
+authors:
+  - name: "PureTearsDropped"
+license: 0BSD
+repository-code: "https://github.com/PureTearsDropped/total-arith-cuda"
+abstract: "Total arithmetic (never emits NaN/Inf; saturation carries one-sided-bound flags) on torch/CUDA, with wiring-as-computation: swap one structure tensor and the same kernel computes complex, quaternion, sedenion, matrix product, or convolution. Includes the Total Bilinear Machine (TBM) spec and a conformance test where one program runs bit-identically on CPU, fused-Triton GPU, Julia, and auto-generated SystemVerilog gates."
+keywords:
+  - "total arithmetic"
+  - "GPU"
+  - "CUDA"
+  - "Triton"
+  - "bilinear algorithms"
+  - "hypercomplex numbers"
+  - "reproducibility"
