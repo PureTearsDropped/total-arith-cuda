@@ -242,6 +242,54 @@ def group_mul(T, a, b):
 
 
 # ---------------------------------------------------------------- 自己テスト
+# ============================================================ 高レベル要素演算の GPU 化
+def _tot64(v, f):
+    "nested_registry._tot の torch/f64/成分ごと 版 (SING=0x01, OVER=0x04)"
+    nan = torch.isnan(v)
+    v = torch.where(nan, torch.zeros_like(v), v)
+    f = f | nan.to(torch.uint8) * 0x01
+    ovf = ~torch.isfinite(v)
+    v = torch.where(ovf, torch.sign(v) * torch.finfo(torch.float64).max, v)
+    return v, f | ovf.to(torch.uint8) * 0x04
+
+def ekernel_gpu(name, arr, order=None, device="cuda"):
+    """nested_registry.ekernel (高レベル演算の スカラー胞 = 1×1 = 数 の カーネル化) の GPU 双子。
+       契約: 同じ テープ・同じ 蓄積順序を f64 の torch で — **値は numpy 版と ビット一致**
+       (self_test が 恒久検査)。フラグは nested 意味論 (SING/OVER/INEXACT) を **成分ごと** に
+       持つ (numpy 版の 全体 OR より 細かい: どの成分が 壊れたかまで 名指し。OR すると numpy 版に
+       一致 — これも 検査)。name: nested_registry.OPS の 演算名 or 配列関数 f(tensor)→tensor
+       (任意関数too — 中身は 黒箱でも 入口/出口の 税関で 嘘は 出ない)。戻り (値tensor, 旗tensor)。"""
+    from nested_registry import OPS
+    v = arr.to(torch.float64) if torch.is_tensor(arr) else \
+        torch.as_tensor(np.asarray(arr, float), dtype=torch.float64, device=device)
+    v, fl = _tot64(v, torch.zeros(v.shape, dtype=torch.uint8, device=v.device))
+    if callable(name):
+        y = name(v)
+        return _tot64(y, fl)
+    op = OPS[name]
+    X = v - 1.0 if op["shift"] else v
+    tape, ordr = op["tape"], (order or op["order"])
+    acc = torch.full_like(X, float(tape(0)))
+    P = torch.ones_like(X)
+    for k in range(1, ordr + 1):
+        P, fl = _tot64(P * X, fl)
+        ck = float(tape(k))
+        if ck != 0.0:
+            acc, fl = _tot64(acc + P * ck, fl)
+    if op["kind"] == "forward":
+        return acc, fl
+    if name == "log":
+        ev, _ = ekernel_gpu("exp", acc)
+        resid = (ev - v).abs()
+    elif name == "sqrt":
+        resid = (acc * acc - v).abs()
+    elif name == "cbrt":
+        resid = (acc * acc * acc - v).abs()
+    else:
+        resid = (acc * v - 1.0).abs()
+    bad = ~(resid < 1e-6)                                     # NaN too 破れ扱い
+    return acc, fl | bad.to(torch.uint8) * 0x08              # INEXACT
+
 def self_test():
     import numpy as np
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -492,6 +540,35 @@ def self_test():
     print(f"  (0,=)×(3,GE): flag={int(rG.flag.item())} = 厳密な真の0 {'✓' if regG else '×'}")
     assert bad6 == 0 and reg6 and regA and regB and regC and regD and regE and regF and regG
 
+    print()
+    print()
+    print("⑥ 高レベル要素演算の GPU 化: ekernel_gpu ≡ nested_registry.ekernel (ビット一致契約)")
+    from nested_registry import ekernel, Nel as _Nel
+    import time as _time
+    rngk = np.random.default_rng(9)
+    sck = rngk.standard_normal(1_000_000) * 0.4 + 1.0
+    sck[7] = 9.0                                              # 1成分 汚染
+    for opn in ("exp", "sqrt", "log"):
+        gv, gf = ekernel_gpu(opn, sck)
+        nk = ekernel(opn, sck)
+        assert np.array_equal(gv.cpu().numpy(), nk.c), opn    # 値: 1e6 成分 ビット一致
+        orf = int(np.bitwise_or.reduce(gf.cpu().numpy()))
+        assert orf == nk.flag, opn                            # 旗: 成分 OR = numpy の 全体旗
+    gf7 = int(ekernel_gpu("sqrt", sck)[1][7].item())
+    assert (gf7 & 0x08) and int(ekernel_gpu("sqrt", sck)[1][:7].max().item()) == 0
+    gs, _ = ekernel_gpu(torch.sign, sck)                      # 任意関数too: sign = スカラー nnormalize
+    assert np.array_equal(gs.cpu().numpy(), ekernel(np.sign, sck).c)
+    _, gfz = ekernel_gpu(lambda a: 1.0 / a, np.array([2.0, 0.0, 4.0]))
+    assert int(gfz[1].item()) & 0x04                          # 黒箱の 1/0=∞ → 出口税関 OVER (成分名指し)
+    big = rngk.standard_normal(10_000_000) * 0.4 + 1.0
+    t0 = _time.perf_counter(); ekernel("exp", big); tn = _time.perf_counter() - t0
+    bigT = torch.as_tensor(big, dtype=torch.float64, device="cuda")
+    ekernel_gpu("exp", bigT); torch.cuda.synchronize()        # warm
+    t0 = _time.perf_counter(); ekernel_gpu("exp", bigT); torch.cuda.synchronize()
+    tg = _time.perf_counter() - t0
+    print(f"  exp/sqrt/log 1e6成分: 値ビット一致 ✓ ・旗OR一致 ✓ ・汚染成分[7]だけ INEXACT (成分名指し) ✓")
+    print(f"  任意関数 (sign・黒箱1/0=∞→OVER) ✓ ; 速度 1e7成分 exp: numpy {tn*1e3:.0f}ms → "
+          f"GPU f64 {tg*1e3:.1f}ms ({tn/tg:.0f}×)")
     print()
     print("GPU 版: 全域算術（無NaN・フラグ）+ 配線表差し替え + 飽和は最後に1回、が torch で 動く。")
 
