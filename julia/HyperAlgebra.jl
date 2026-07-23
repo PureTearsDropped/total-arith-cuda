@@ -33,18 +33,26 @@ end
 # Entry totalization (added after external AI audit 2026-07-19): the public constructor
 # itself totalizes — NaN→(0, no-bound+SUNK), ±Inf / out-of-range→±MAX+GE, subnormal→±MIN+LE.
 # "Never NaN/Inf" only becomes an invariant when the entry door enforces it.
-Tot(v::AbstractArray{<:Real}) = Tot(_sat(Float64.(v))...)
+# max/min: 宣言ドメイン — 入口税関の 境界を 機械の 都合 (f32) でなく 対象の 仕様で 置く
+# (センサの ±16g・アクチュエータの レール等・python 双子と 同仕様)。GE=クリップは 実機の
+# ネイティブ意味論。省略時は 機械ドメイン。
+Tot(v::AbstractArray{<:Real}; max = nothing, min = nothing) =
+    Tot(_sat(Float64.(v);
+             MAXd = max === nothing ? Float64(MAXF) : Float64(max),
+             MINd = min === nothing ? Float64(MINF) : Float64(min))...)
 
 # ---- totalize: Float64 raw -> (Float32 val, UInt8 flag). Never emits NaN/Inf. ----
-function _sat(raw::AbstractArray{Float64})
+function _sat(raw::AbstractArray{Float64}; MAXd::Float64 = Float64(MAXF),
+              MINd::Float64 = Float64(MINF))
+    @assert 0.0 < MINd < MAXd <= Float64(MAXF) "宣言ドメインは 0 < min < max ≤ f32MAX"
     nanm  = isnan.(raw)
     raw   = ifelse.(nanm, 0.0, raw)
     s     = sign.(raw)
     a     = abs.(raw)
-    over  = a .> MAXF                                # Inf lands here too
-    under = (a .> 0) .& (a .< MINF)
-    val   = Float32.(ifelse.(over, s .* Float64(MAXF),
-                     ifelse.(under, s .* Float64(MINF), raw)))
+    over  = a .> MAXd                                # Inf lands here too
+    under = (a .> 0) .& (a .< MINd)
+    val   = Float32.(ifelse.(over, s .* MAXd,
+                     ifelse.(under, s .* MINd, raw)))
     flag  = (UInt8.(over) .* GE) .| (UInt8.(under) .* LE) .|
             (UInt8.(nanm) .* (GE | LE | SUNK))
     return val, flag
@@ -314,6 +322,17 @@ function self_test()
     println("  (+MIN,LE)+(−MIN,=): flag=$(Int(rr.flag[1])) = no-bound+SUNK " *
             (reg_ok ? "✓" : "✗ (old version: LE = a lie)"))
     @assert ok_entry && zok && reg_ok
+    # 宣言ドメイン (python 双子と 同仕様): 境界を 対象の 仕様で — 例: 加速度計 ±16g
+    g16 = 16 * 9.8
+    sens = Tot([9.8, 1e8, -1e8, NaN, 1e-9]; max = g16, min = 1e-6)
+    dom_ok = sens.flag[1] == 0 && abs(sens.val[1] - 9.8) < 1e-5 &&
+             sens.flag[2] == GE && abs(sens.val[2] - g16) < 1e-3 &&
+             sens.flag[3] == GE && abs(sens.val[3] + g16) < 1e-3 &&
+             sens.flag[4] == (GE | LE | SUNK) && sens.val[4] == 0.0f0 &&
+             sens.flag[5] == LE && abs(sens.val[5] - 1e-6) < 1e-12
+    println("  宣言ドメイン Tot(x; max=16g): 素通り/クリップ→±16g+GE/NaN→0+全旗/微小→min+LE " *
+            (dom_ok ? "✓" : "✗"))
+    @assert dom_ok
 
     println("="^72)
     println("⑤ flag-algebra oracle: sample admissible true values, check the contract")
