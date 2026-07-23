@@ -417,6 +417,23 @@ def nsolve(A, a, b, side="left", tol=1e-8):
     f = f if r1 < tol else (f | SING if r2 < tol else f | SING | INEXACT)
     return _tot(yv, f), r1
 
+def emap(cell, name, x, order=None, bracket="left"):
+    """要素写像 = 行列 (や 任意の 容器) の 「活性化関数」: x を cell.dim ごとの 塊 (mat_over の
+       成分・tensor(·, cell) の 第2因子) に 割り、各塊に 同じ 単項演算 nop(cell, name, ·) を
+       **別々に** 適用する。NN が 行列に 活性化を 掛ける形 そのもの。
+       行列関数 nop(mat_over(cell,N), name, ·) とは 別物 — 一致するのは 対角行列だけ
+       (測って 主張)。五モード bracket は 塊ごとに そのまま 通る。フラグは 塊ごとに 立てて OR
+       (1成分の 失敗too 黙らない)。"""
+    d = cell.dim
+    assert len(x.c) % d == 0, "容器の 次元が cell.dim の 倍数で ない"
+    out = np.empty_like(x.c)
+    flag = 0
+    for k in range(len(x.c) // d):
+        ye = nop(cell, name, Nel(x.c[k * d:(k + 1) * d], x.flag), order=order, bracket=bracket)
+        out[k * d:(k + 1) * d] = ye.c
+        flag |= ye.flag
+    return Nel(out, flag)
+
 def list_ops():
     for nm in sorted(OPS):
         k = OPS[nm]["kind"]
@@ -888,6 +905,29 @@ def self_test():
     print(f"bop生成器: comm=(1,−1) (ad=L−R・反対称・対称化で0) ✓ ; anti=(1,1)=L+R=2·Jordan ✓ ; "
           f"任意ペンシル(2,−1) 胞≡作用・逆演算too自動 ✓ ; [x,q]=y は SING宣言 ✓ ; "
           f"exp(ad_x)=Ad_exp(x) 随伴表現 {dad:.0e} ✓ — 演算は 列挙でなく (種類,経路) の 座標から 生成")
+    # --- emap: 行列の 要素写像 (活性化関数の 形) — 行列関数と 別物なのを 測る ---
+    xa = nel(Mh, 0.3 * rng.standard_normal(16))               # Mh = mat2⟨ℍ⟩ (上で 定義済)
+    ea = emap(H, "exp", xa)
+    for k in range(4):                                        # 構成: 各成分 = 成分ごとの exp
+        assert np.abs(ea.c[k*4:(k+1)*4] - nop(H, "exp", nel(H, xa.c[k*4:(k+1)*4])).c).max() < 1e-14
+    dme = float(np.abs(ea.c - nop(Mh, "exp", xa).c).max())
+    assert dme > 1e-3                                         # 要素写像 ≠ 行列関数 (一般)
+    xdg = np.zeros(16)
+    xdg[0:4], xdg[12:16] = 0.4 * rng.standard_normal(4), 0.4 * rng.standard_normal(4)
+    xd = nel(Mh, xdg)
+    # 対角行列での 一致は f(0)=0 の 関数だけ (sin): exp は f(0)=1 なので 非対角の 0 成分が
+    # 要素写像→単位元 vs 行列関数→0 に 割れる (np.exp(対角行列) ≠ expm と 同じ 現象) — 測る
+    ddg = float(np.abs(emap(H, "sin", xd).c - nop(Mh, "sin", xd).c).max())
+    assert ddg < 1e-9                                         # f(0)=0 ⟹ 対角で 一致
+    dex = float(np.abs(emap(H, "exp", xd).c - nop(Mh, "exp", xd).c).max())
+    assert abs(dex - 1.0) < 1e-9                              # exp: 差は ちょうど 非対角の 単位元
+    xnb = np.concatenate([H.unit + 0.2 * rng.standard_normal(4) for _ in range(4)])
+    assert not (emap(H, "sqrt", nel(Mh, xnb)).flag & INEXACT)
+    xnb[4:8] += 10.0                                          # (0,1)成分だけ 域外へ 汚染
+    assert emap(H, "sqrt", nel(Mh, xnb)).flag & INEXACT       # 1成分の 失敗too 旗で 上がる
+    print(f"emap: 要素写像=活性化の形 ✓ (成分ごとexp・行列expと 別物 {dme:.2f}・f(0)=0 の sin だけ "
+          f"対角で 一致 {ddg:.0e}・exp の 対角差= 非対角単位元 ちょうど1.0・1成分汚染が INEXACT で "
+          f"上がる) — 容器は mat_over too tensor too 塊で 通る")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)

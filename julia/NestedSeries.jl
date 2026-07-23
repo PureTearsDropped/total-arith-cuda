@@ -471,6 +471,25 @@ function nop(A::Alg, name::Symbol, x::Nel, y::Nel; bracket::Symbol = :left)
     bop(A, pen, x, y; path = bracket in (:laction, :raction) ? :action : :cell)
 end
 
+"""要素写像 (python emap の 双子) = 行列 (や 任意の 容器) の 「活性化関数」: x を cell.dim
+   ごとの 塊 (mat_over の 成分・tensor(·, cell) の 第2因子) に 割り、各塊に 同じ 単項演算
+   nop(cell, name, ·) を **別々に** 適用。行列関数とは 別物 — 対角行列で 一致するのは
+   f(0)=0 の 関数だけ (exp は f(0)=1 なので 非対角 0 成分が 単位元 vs 0 に 割れる — 測って
+   主張)。フラグは 塊ごとに 立てて OR (1成分の 失敗too 黙らない)。"""
+function emap(cell::Alg, name::Symbol, x::Nel; order::Union{Int,Nothing} = nothing,
+              bracket::Symbol = :left)
+    d = cell.dim
+    @assert length(x.c) % d == 0 "容器の 次元が cell.dim の 倍数で ない"
+    out = similar(x.c)
+    flag = 0x00
+    for k in 0:(length(x.c) ÷ d - 1)
+        ye = nop(cell, name, Nel(x.c[k*d+1:(k+1)*d], x.flag); order, bracket)
+        out[k*d+1:(k+1)*d] = ye.c
+        flag |= ye.flag
+    end
+    Nel(out, flag)
+end
+
 "print the preset shelf: name, kind, and what the candidate verification checks"
 function list_ops()
     for (nm, op) in sort(collect(OPS); by = first)
@@ -1121,6 +1140,23 @@ function self_test()
     @assert (flagof(bop(H4, :comm, xh, yh; path = :solve)) & SING) != 0  # [x,q]=y: ad特異 → SING宣言
     println("bop生成器: comm=(1,−1)=ad=L−R ✓ ; anti=(1,1)=2·Jordan ✓ ; 任意ペンシル(2,−1) ",
             "胞≡作用・逆演算too自動 ✓ ; [x,q]=y は SING宣言 ✓ — 演算は (種類,経路) の 座標から 生成")
+    # --- emap: 行列の 要素写像 (活性化の 形) ---
+    Mh4 = mat_over(H4, 2)
+    xa2 = nel(Mh4, 0.3 .* rand_vec(gg, 16))
+    ea2 = emap(H4, :exp, xa2)
+    @assert maximum(abs.(coeffs(ea2)[1:4] .- coeffs(nop(H4, :exp, nel(H4, xa2.c[1:4]))))) < 1e-14
+    @assert maximum(abs.(coeffs(ea2) .- coeffs(nop(Mh4, :exp, xa2)))) > 1e-3    # ≠ 行列関数
+    xdg = zeros(16); xdg[1:4] = 0.4 .* rand_vec(gg, 4); xdg[13:16] = 0.4 .* rand_vec(gg, 4)
+    xdl = nel(Mh4, xdg)
+    @assert maximum(abs.(coeffs(emap(H4, :sin, xdl)) .- coeffs(nop(Mh4, :sin, xdl)))) < 1e-9
+    dex = maximum(abs.(coeffs(emap(H4, :exp, xdl)) .- coeffs(nop(Mh4, :exp, xdl))))
+    @assert abs(dex - 1.0) < 1e-9                    # exp の 対角差 = 非対角の 単位元 ちょうど 1
+    xnb = vcat([H4.unit .+ 0.2 .* rand_vec(gg, 4) for _ in 1:4]...)
+    @assert (flagof(emap(H4, :sqrt, nel(Mh4, xnb))) & INEXACT) == 0
+    xnb[5:8] .+= 10.0
+    @assert (flagof(emap(H4, :sqrt, nel(Mh4, xnb))) & INEXACT) != 0
+    println("emap: 要素写像=活性化の形 ✓ (行列expと別物・f(0)=0 の sin だけ対角一致・",
+            "exp の対角差=非対角単位元 1.0・1成分汚染が INEXACT で上がる)")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 
