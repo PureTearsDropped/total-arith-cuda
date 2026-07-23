@@ -163,6 +163,95 @@ def fused_totalize(x) -> Tot:
     return Tot(v.reshape(x.shape), f.reshape(x.shape))
 
 
+# ============================================================ 要素演算 ekernel の 融合
+@triton.jit
+def _ekernel_kernel(X, C, OV, OF, n, ORDER: tl.constexpr, SHIFT: tl.constexpr,
+                    TOT: tl.constexpr, BLOCK: tl.constexpr):
+    """級数 全段 + ステップごと 全域化を レジスタ内で 1 パス。ekernel_gpu (⟺ numpy ekernel) と
+       同じ 蓄積順序 (P←P·x, acc←acc+c_k·P, 毎ステップ nan→0+SING / ∞→±MAX+OVER)。"""
+    MAXF64 = 1.7976931348623157e308
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    x = tl.load(X + offs, mask=m, other=1.0).to(tl.float64)
+    f = tl.zeros((BLOCK,), dtype=tl.int32)
+    if TOT:                                                   # 入口税関
+        nan = x != x
+        f = f | tl.where(nan, 1, 0)
+        x = tl.where(nan, 0.0, x)
+        ovf = tl.abs(x) > MAXF64
+        f = f | tl.where(ovf, 4, 0)
+        x = tl.where(ovf, tl.where(x > 0, MAXF64, -MAXF64), x)
+    if SHIFT:
+        x = x - 1.0
+    acc = tl.zeros((BLOCK,), dtype=tl.float64) + tl.load(C + 0)
+    P = tl.zeros((BLOCK,), dtype=tl.float64) + 1.0
+    for k in tl.static_range(1, ORDER + 1):
+        P = P * x
+        if TOT:
+            nan = P != P
+            f = f | tl.where(nan, 1, 0)
+            P = tl.where(nan, 0.0, P)
+            ovf = tl.abs(P) > MAXF64
+            f = f | tl.where(ovf, 4, 0)
+            P = tl.where(ovf, tl.where(P > 0, MAXF64, -MAXF64), P)
+        ck = tl.load(C + k)
+        nz = ck != 0.0                                        # 係数 0 は 完全スキップ (numpy と 同一)
+        # FMA 縮約の 阻止: mul と add を 別々に 丸めないと numpy/torch と 最大 3ulp ずれる
+        # (実測 62165/1e6 成分)。ランタイム条件の select を 挟むと LLVM は mul→add を
+        # fma に 融合できない — ビット一致契約の ための 意図的な 遠回り。
+        pc = tl.where(n >= 0, P * ck, 0.0)
+        acc2 = acc + pc
+        if TOT:
+            nan2 = acc2 != acc2
+            f = f | tl.where(nz & nan2, 1, 0)
+            acc2 = tl.where(nan2, 0.0, acc2)
+            ovf2 = tl.abs(acc2) > MAXF64
+            f = f | tl.where(nz & ovf2, 4, 0)
+            acc2 = tl.where(ovf2, tl.where(acc2 > 0, MAXF64, -MAXF64), acc2)
+        acc = tl.where(nz, acc2, acc)
+    tl.store(OV + offs, acc, mask=m)
+    tl.store(OF + offs, f.to(tl.uint8), mask=m)
+
+
+_EK_COEFS = {}
+
+def fused_ekernel(name, x, order=None, tot=True):
+    """cuda_total.ekernel_gpu の 融合版: 級数 全段 + 全域化が レジスタ内で 完結し、HBM は
+       入出力の 1 往復だけ (未融合は 級数 1 段 ≈ カーネル 数個 × order)。契約: 値・成分ごと旗
+       とも ekernel_gpu と ビット一致 (self_test が 恒久検査) — つまり numpy ekernel とも 一致。
+       tot=False は 全域化なしの 対照 (誠実さ税の 測定用)。candidate の 検算は 出口で 数パス。"""
+    from nested_registry import OPS
+    from cuda_total import _tot64
+    op = OPS[name]
+    ordr = order or op["order"]
+    key = (name, ordr)
+    if key not in _EK_COEFS:
+        _EK_COEFS[key] = torch.tensor([float(op["tape"](k)) for k in range(ordr + 1)],
+                                      dtype=torch.float64, device="cuda")
+    xT = x if torch.is_tensor(x) else torch.as_tensor(
+        __import__("numpy").asarray(x, float), dtype=torch.float64, device="cuda")
+    n = xT.numel()
+    ov = torch.empty_like(xT)
+    of = torch.empty(n, dtype=torch.uint8, device=xT.device)
+    BLOCK = 1024
+    _ekernel_kernel[((n + BLOCK - 1) // BLOCK,)](
+        xT, _EK_COEFS[key], ov, of, n, ORDER=ordr, SHIFT=bool(op["shift"]),
+        TOT=bool(tot), BLOCK=BLOCK)
+    if op["kind"] == "forward" or not tot:
+        return ov, of
+    vt, _ = _tot64(xT, torch.zeros(n, dtype=torch.uint8, device=xT.device))
+    if name == "log":
+        resid = (fused_ekernel("exp", ov)[0] - vt).abs()
+    elif name == "sqrt":
+        resid = (ov * ov - vt).abs()
+    elif name == "cbrt":
+        resid = (ov * ov * ov - vt).abs()
+    else:
+        resid = (ov * vt - 1.0).abs()
+    return ov, of | (~(resid < 1e-6)).to(torch.uint8) * 0x08
+
+
 # ---------------------------------------------------------------- self-test: 影は本体と一致するか
 def self_test():
     dev = torch.device('cuda')
@@ -217,6 +306,34 @@ def self_test():
           f"  {'✓ 完全一致' if nv == 0 and nf == 0 else '← 要調査'}")
     assert nv == 0 and nf == 0
     print("★ 融合カーネル = 本体の忠実な影 (フラグ ビット一致・値 float32 一致)")
+    # ekernel の 融合too 影: 値・成分ごと旗 とも ekernel_gpu と ビット一致か
+    from cuda_total import ekernel_gpu
+    import numpy as _np
+    rngk = _np.random.default_rng(11)
+    sck = rngk.standard_normal(1_000_000) * 0.4 + 1.0
+    sck[7] = 9.0                                              # 検算破れ → INEXACT
+    sck[11] = float("nan"); sck[13] = float("inf")            # 税関 → SING / OVER
+    for opn in ("exp", "sqrt", "log"):
+        gv, gf = ekernel_gpu(opn, sck)
+        fv, ff = fused_ekernel(opn, sck)
+        nv = int((gv != fv).sum()); nf = int((gf != ff).sum())
+        print(f"  fused_ekernel {opn}: 値の不一致 {nv}/1e6  旗の不一致 {nf}/1e6"
+              f"  {'✓ 完全一致' if nv == 0 and nf == 0 else '← 要調査'}")
+        assert nv == 0 and nf == 0
+    import time as _t
+    big = torch.as_tensor(rngk.standard_normal(10_000_000) * 0.4 + 1.0,
+                          dtype=torch.float64, device=dev)
+    def _g(fn):
+        fn(); torch.cuda.synchronize()
+        t0 = _t.perf_counter(); fn(); torch.cuda.synchronize()
+        return _t.perf_counter() - t0
+    t_un = _g(lambda: ekernel_gpu("exp", big))
+    t_fu = _g(lambda: fused_ekernel("exp", big))
+    t_fr = _g(lambda: fused_ekernel("exp", big, tot=False))
+    t_lm = _g(lambda: torch.exp(big))
+    print(f"  1e7成分 exp: 未融合 {t_un*1e3:.1f}ms → 融合 {t_fu*1e3:.2f}ms ({t_un/t_fu:.0f}×)"
+          f" / 全域化なし {t_fr*1e3:.2f}ms → レジスタ内の 誠実さ税 {t_fu/t_fr:.2f}×"
+          f" / torch.exp(libm) {t_lm*1e3:.2f}ms → 差 {t_fu/t_lm:.1f}×")
 
 
 def benchmark():
