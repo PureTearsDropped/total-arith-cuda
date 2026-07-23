@@ -417,19 +417,28 @@ def nsolve(A, a, b, side="left", tol=1e-8):
     f = f if r1 < tol else (f | SING if r2 < tol else f | SING | INEXACT)
     return _tot(yv, f), r1
 
+def nnormalize(A, x):
+    """a/‖a‖ — 実スカラー除算のみ (方向は そのまま・0→0 は 公理 a/0=0)。どの Alg でも 同じ
+       1本: 胞に 使えば 成分の 正規化、容器 (mat_over 等) に 使えば 行列全体の 大域正規化。"""
+    n = float(np.linalg.norm(x.c))
+    return _tot(x.c / n if n > 0.0 else x.c * 0.0, x.flag)
+
 def emap(cell, name, x, order=None, bracket="left"):
     """要素写像 = 行列 (や 任意の 容器) の 「活性化関数」: x を cell.dim ごとの 塊 (mat_over の
-       成分・tensor(·, cell) の 第2因子) に 割り、各塊に 同じ 単項演算 nop(cell, name, ·) を
-       **別々に** 適用する。NN が 行列に 活性化を 掛ける形 そのもの。
-       行列関数 nop(mat_over(cell,N), name, ·) とは 別物 — 一致するのは 対角行列だけ
-       (測って 主張)。五モード bracket は 塊ごとに そのまま 通る。フラグは 塊ごとに 立てて OR
-       (1成分の 失敗too 黙らない)。"""
+       成分・tensor(·, cell) の 第2因子) に 割り、各塊に 同じ 単項演算を **別々に** 適用する。
+       NN が 行列に 活性化を 掛ける形 そのもの。name は 棚の 演算名 (OPS) **または 任意の
+       呼び出し可能 f(cell, Nel)→Nel** (例: nnormalize, 自作活性化) — 棚に ない 関数too 通る。
+       行列関数 nop(mat_over(cell,N), name, ·) とは 別物 — 対角行列で 一致するのは f(0)=0 の
+       関数だけ (測って 主張)。五モード bracket は 塊ごとに そのまま 通る。フラグは 塊ごとに
+       立てて OR (1成分の 失敗too 黙らない)。"""
     d = cell.dim
     assert len(x.c) % d == 0, "容器の 次元が cell.dim の 倍数で ない"
+    f = name if callable(name) else (
+        lambda C, v: nop(C, name, v, order=order, bracket=bracket))
     out = np.empty_like(x.c)
     flag = 0
     for k in range(len(x.c) // d):
-        ye = nop(cell, name, Nel(x.c[k * d:(k + 1) * d], x.flag), order=order, bracket=bracket)
+        ye = f(cell, Nel(x.c[k * d:(k + 1) * d], x.flag))
         out[k * d:(k + 1) * d] = ye.c
         flag |= ye.flag
     return Nel(out, flag)
@@ -928,6 +937,20 @@ def self_test():
     print(f"emap: 要素写像=活性化の形 ✓ (成分ごとexp・行列expと 別物 {dme:.2f}・f(0)=0 の sin だけ "
           f"対角で 一致 {ddg:.0e}・exp の 対角差= 非対角単位元 ちょうど1.0・1成分汚染が INEXACT で "
           f"上がる) — 容器は mat_over too tensor too 塊で 通る")
+    # --- emap × 任意関数: 成分ごと 正規化・自作活性化・大域正規化 (同じ nnormalize 1本) ---
+    xz = xa.c.copy(); xz[8:12] = 0.0                          # (1,0) 成分を 真の 0 に
+    en = emap(H, nnormalize, nel(Mh, xz))                     # 成分ごと a/‖a‖
+    nrm = [float(np.linalg.norm(en.c[k*4:(k+1)*4])) for k in range(4)]
+    assert max(abs(n - 1.0) for k, n in enumerate(nrm) if k != 2) < 1e-12
+    assert nrm[2] == 0.0                                      # 0 成分は 0 のまま (a/0=0・旗なし嘘なし)
+    squash = lambda C, v: tscale(v, 1.0 / (1.0 + float(np.linalg.norm(v.c))))   # 自作活性化
+    eq = emap(H, squash, nel(Mh, xz))                         # ノルムで 潰す「四元数 sigmoid」
+    assert max(float(np.linalg.norm(eq.c[k*4:(k+1)*4])) for k in range(4)) < 1.0
+    gn = nnormalize(Mh, nel(Mh, xz))                          # 同じ 1本を 容器に = 大域正規化
+    assert abs(float(np.linalg.norm(gn.c)) - 1.0) < 1e-12
+    print("emap×任意関数: 成分ごと nnormalize (全成分‖·‖=1・0成分は0のまま) ✓ ; 自作活性化 "
+          "squash=v/(1+‖v‖) ✓ ; 同じ nnormalize を 容器に=大域正規化 ✓ — 棚の 演算名でも "
+          "呼び出し可能でも 塊ごとに 通る")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)

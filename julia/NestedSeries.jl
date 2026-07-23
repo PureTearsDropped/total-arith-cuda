@@ -476,14 +476,17 @@ end
    nop(cell, name, ·) を **別々に** 適用。行列関数とは 別物 — 対角行列で 一致するのは
    f(0)=0 の 関数だけ (exp は f(0)=1 なので 非対角 0 成分が 単位元 vs 0 に 割れる — 測って
    主張)。フラグは 塊ごとに 立てて OR (1成分の 失敗too 黙らない)。"""
-function emap(cell::Alg, name::Symbol, x::Nel; order::Union{Int,Nothing} = nothing,
+function emap(cell::Alg, name, x::Nel; order::Union{Int,Nothing} = nothing,
               bracket::Symbol = :left)
+    # name = 棚の 演算名 (Symbol) または 任意の 関数 f(cell, Nel)→Nel (例: nnormalize,
+    # 自作活性化) — 棚に ない 関数too 塊ごとに 通る (python emap と 同仕様)
     d = cell.dim
     @assert length(x.c) % d == 0 "容器の 次元が cell.dim の 倍数で ない"
+    f = name isa Symbol ? ((C, v) -> nop(C, name, v; order, bracket)) : name
     out = similar(x.c)
     flag = 0x00
     for k in 0:(length(x.c) ÷ d - 1)
-        ye = nop(cell, name, Nel(x.c[k*d+1:(k+1)*d], x.flag); order, bracket)
+        ye = f(cell, Nel(x.c[k*d+1:(k+1)*d], x.flag))
         out[k*d+1:(k+1)*d] = ye.c
         flag |= ye.flag
     end
@@ -1157,6 +1160,17 @@ function self_test()
     @assert (flagof(emap(H4, :sqrt, nel(Mh4, xnb))) & INEXACT) != 0
     println("emap: 要素写像=活性化の形 ✓ (行列expと別物・f(0)=0 の sin だけ対角一致・",
             "exp の対角差=非対角単位元 1.0・1成分汚染が INEXACT で上がる)")
+    # --- emap × 任意関数: 成分ごと 正規化・自作活性化・大域正規化 (同じ nnormalize 1本) ---
+    xz2 = copy(xa2.c); xz2[9:12] .= 0.0
+    en2 = emap(H4, nnormalize, nel(Mh4, xz2))
+    nrms = [LinearAlgebra.norm(en2.c[k*4+1:(k+1)*4]) for k in 0:3]
+    @assert maximum(abs(nrms[k] - 1.0) for k in (1, 2, 4)) < 1e-12 && nrms[3] == 0.0
+    squash = (C, v) -> tscale(v, 1.0 / (1.0 + LinearAlgebra.norm(v.c)))
+    @assert maximum(LinearAlgebra.norm(emap(H4, squash, nel(Mh4, xz2)).c[k*4+1:(k+1)*4])
+                    for k in 0:3) < 1.0
+    @assert abs(LinearAlgebra.norm(coeffs(nnormalize(Mh4, nel(Mh4, xz2)))) - 1.0) < 1e-12
+    println("emap×任意関数: 成分ごと nnormalize (‖·‖=1・0成分は0のまま) ✓ ; 自作活性化 squash ✓ ; ",
+            "同じ nnormalize を 容器に=大域正規化 ✓")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 
