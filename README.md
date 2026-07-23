@@ -1,10 +1,23 @@
-# total-arith-cuda
+# total-arith-cuda — the Total Bilinear Machine (TBM)
 
-**Total arithmetic on the GPU (torch/CUDA) — a kernel that never emits `NaN`/`Inf`, plus a swappable structure tensor: change one table and the same kernel computes complex, quaternion, sedenion, matrix product, or convolution.**
+**A small computer for honest arithmetic.** Its core is one *totalized bilinear* multiply
+`c = Wᵀ((U·a)⊙(V·b))` over numbers that are `(value, quality-flag)` pairs — it **never
+emits `NaN`/`Inf`**, every algebra (complex … sedenion, matrices, convolution, *your own*)
+is a swappable table, exp/log/sqrt/solve are *programs* built on that one instruction, and
+the same program runs **bit-identically on CPU (torch), GPU (fused Triton), and
+auto-generated SystemVerilog gates**.
 
 > ⚠️ Written with AI assistance. Every claim ships with a command that reproduces it. Verify before relying on it.
 
 日本語は下段に。
+
+## Three doors — pick the one that matches you / 三つの入口
+
+| you are… | what you get here | start at |
+|---|---|---|
+| **"I want GPU math that never silently fails"** | `(val, flag)` numbers: overflow→`±MAX`+flag, `a/0=0`, `NaN` never exists; **solve that returns a least-squares answer + `SING` flag instead of crashing on singular/zero-divisor systems** — 67.4 M solves/s, 13–35× vs batched `pinv` | `cuda_total.py`, `cuda_fused_solve.py` |
+| **"I work with quaternions / octonions / my own algebra"** | register an algebra from **two small tables** → exp/log/sqrt/sin/…, five association modes, division in three senses, element-wise maps, all **derived automatically and verified** — matrices over your algebra included; quaternion-rotation ops at parity speed with roma/kornia, plus flags they don't have | `nested_registry.py` (`table_alg`, `nop`, `bop`, `emap`, `nsolve`) |
+| **"I care about compilation / hardware"** | a 6-instruction machine ([TBM_SPEC.md](TBM_SPEC.md)); programs compile to CPU / fused Triton / SystemVerilog RTL and pass a **bit-exact conformance test with adversarial NaN/Inf injection**; ternary wiring contract → straight-line kernel codegen | `TBM_SPEC.md`, `run_everywhere.py`, `cuda_fused.py` |
 
 ---
 
@@ -39,17 +52,65 @@ computer whose only multiplying instruction is the totalized bilinear contractio
 `c = Wᵀ((U·a)⊙(V·b))` over `(val, flag)` operands. Six instructions total
 (TOTALIZE / BILIN / LINMAP / AXPY / NORM / CHECK); everything else — exp, solve, FFT
 convolution, law discovery — is a *program* (macro), and that smallness is the point.
-Every instruction carries an **honesty dial** (`evidence` / `coarse` / `bare`), because the
-cost of honesty is graded, not flat (measured: evidence is *free* at control-loop batch
-sizes, 37× at bulk; coarse is 1.13× ≈ free at bulk — so forensic flags at the boundary,
-coarse flags inside is *optimal*, not a compromise). `tbm.py` is the assembler (a thin
-layer: all semantics live in the audited modules it calls); `run_everywhere.py` is the
-conformance test — **the same program runs on CPU (torch), GPU (fused Triton), and
-auto-generated SystemVerilog gates (iverilog RTL simulation, 48,222-gate sedenion
-components), with bit-identical values and bit-identical flags, adversarial Inf/NaN
-injection included** (passed 2026-07-21).
+("One multiply instruction" does **not** mean the machine can only multiply: BILIN
+realizes *any* bilinear map, LINMAP/AXPY are its degenerate linear/additive forms, and
+higher operations are program compositions — the claim is that one multiplying semantics
+suffices, the way one ALU suffices in a CPU.)
+
+Every instruction carries an **honesty dial**, because the cost of honesty is graded, not
+flat (measured, RTX 5090):
+
+| dial | what it keeps | measured cost |
+|---|---|---|
+| `evidence` | full forensic flags (pattern rule P0–P4, dangerous zeros, sign tracking) | **free** at control-loop batch sizes; 37× at bulk |
+| `coarse` | never-lying coarse flags (whole-row GE\|LE\|SUNK on any contamination) | **1.13× ≈ free** at bulk |
+| `bare` | values only | 1× |
+
+so *forensic flags at the boundary, coarse flags inside* is measured-optimal, not a
+compromise. `tbm.py` is the assembler (a thin layer: all semantics live in the audited
+modules it calls); `run_everywhere.py` is the conformance test — **the same program runs
+on CPU (torch), GPU (fused Triton), and auto-generated SystemVerilog gates (iverilog RTL
+simulation, 48,222-gate sedenion components), with bit-identical values and bit-identical
+flags, adversarial Inf/NaN injection included** (passed 2026-07-21).
 
 *Compile once, run on three silicons, never lie.*
+
+### The algebra shelf: two tables in, a verified function library out (2026-07-23)
+
+The **wiring normal form is ternary** (TBM_SPEC §1.5): coefficients live in {−1, 0, +1}
+(× power-of-2 diagonals), so the linear stages are exact in every backend, `R` honestly
+counts the true multiplies, and wirings **compile to straight-line kernels**
+(`cuda_fused.compile_wiring`: quaternion product 6.4× vs dense einsum, values/flags
+bit-identical). Register your own algebra from two tables — `table_alg(name, mul, sig)`
+(path + sign, ternary-gatekept) — and the whole operation family is *derived from the
+table*, nothing hand-written per algebra:
+
+- `nop(A, op, x, bracket=…)` — exp/sin/cos/sinh/cosh/log/sqrt/cbrt/inv in **five
+  association modes** (left / right / symmetric-Jordan / left-action / right-action —
+  kept as separate implementations; identities are measured, not assumed). Candidates
+  verify their defining identity or flag `INEXACT`. Measured law: the five modes agree
+  ⟺ power-associativity (sedenions agree at 1e-15; `mat2⟨𝕆⟩` is the first break, 0.31 —
+  declared, not silenced). Action modes reach beyond the series radius (PSD matrix sqrt
+  without rescaling).
+- `bop(A, (α,β), x, y, path)` — **binary ops generated from pencil coordinates**
+  `αL+βR`: mul (1,0), Jordan (½,½), commutator (1,−1) = ad = L−R, anticommutator (1,1),
+  *any* (α,β); `path` ∈ cell / operator-matrix / solve (pseudo-inverse, two-tier
+  verified) / solve-inv (true inverse — splits observably from pseudo-inverse at zero
+  divisors). `nsolve` = division in three senses (left/right/symmetric).
+- `emap(cell, f, X)` — element-wise map over matrices/containers (the *activation
+  function* shape; f may be a shelf op in any mode **or an arbitrary function**, entry/exit
+  totalized); `nnormalize` = a/‖a‖ with `0→0` (unitization; the unit sphere is
+  multiplicative exactly through the Hurwitz four — measured, sedenions put zero divisors
+  *on* the unit sphere).
+- `ekernel` / `ekernel_gpu` / `fused_ekernel` — the scalar (1×1) case kernelized:
+  bit-identical to the loop at 5,700× (numpy) / +92× (GPU) / +16× (Triton fusion), with a
+  **pre-proof mode** (`tot="auto"`): one range check proves "no overflow/NaN can occur
+  inside", the per-step totalization is then provably an identity and is skipped —
+  honesty tax 3.19× → **1.41×**, and on subnormal-dense CPU data this *reverses* the race
+  (total arithmetic 3.03× **faster** than raw IEEE at 100% density, flat at any density).
+
+Everything above runs unchanged over `mat_over(cell, N)` (matrices over your algebra),
+tensor compositions, and all ALGS shelf citizens.
 
 ### Reproduce
 
@@ -321,18 +382,21 @@ an issue reporting the result (either way) is welcome.
 
 ## これは何か（JP）
 
-**全域算術**と**「配線＝計算」**のGPU（torch/CUDA）実装。数 = `(val: float32, flag: uint8)`。フラグ = `GE`(≥・上飽和) / `LE`(≤・ε潰れ) / `SUNK`(符号不明)。
+**誠実な算術のための小さな計算機（総ビリニア機械 TBM）。** 核は全域化された双線形積
+`c = Wᵀ((U·a)⊙(V·b))` ただ1つ。数 = `(val: float32, flag: uint8)`、フラグ = `GE`(≥・上飽和) / `LE`(≤・ε潰れ) / `SUNK`(符号不明)。
+
+**三つの入口**（冒頭の表と同じ）: ①「黙って壊れないGPU数値計算が欲しい」→ `cuda_total.py`・`cuda_fused_solve.py`（特異/零因子でも落ちず最小二乗解+`SING`旗、67.4M solves/s）。②「四元数・八元数・自作代数を使う」→ `nested_registry.py`（表2枚 `table_alg` で登録すると exp/log/sqrt/solve 一式が自動導出・検算つき）。③「コンパイル・ハードウェアに興味」→ `TBM_SPEC.md`・`run_everywhere.py`（CPU/GPU/RTL でビット一致）。
 
 - **全域**: 溢れ→`±MAX`+`GE`、潰れ→`±MIN=ε`（向き保持）+`LE`、`a/0=0`、**`NaN`/`Inf` は決して出さない**。
-- **配線表 = 構造テンソル `T[k,i,j]`**。`T` を差し替えると同じカーネルが別の代数に（複素・四元数・セデニオン・巡回畳み込み、いずれも違反0）。
+- **配線表 = 構造テンソル `T[k,i,j]`**。`T` を差し替えると同じカーネルが別の代数に（複素・四元数・セデニオン・巡回畳み込み、いずれも違反0）。**配線正規形は三値 {−1,0,+1}**（TBM_SPEC §1.5）——だから配線は直線コードにコンパイルできる（`compile_wiring`: 四元数積 6.4×・ビット一致のまま）。
 - **広く貯めて最後に1回丸め**。群積/MACはfloat64で貯めて最後に一度だけ飽和（＝positの*quire*と同じ規律）。
+- **表2枚→演算族の自動導出**: `nop`（五モード: 左結合/右結合/対称/左作用/右作用——別実装のまま分け、一致は測って主張）・`bop`（二項演算＝ペンシル (α,β) 座標から生成: 積・Jordan・交換子=L−R・反交換子=L+R・任意係数、逆演算も自動）・`emap`（行列の要素写像＝活性化の形・任意関数可）・`nnormalize`（単位化・0→0）・`nsolve`（解く除算three面）。測った法則: 五モード一致⟺べき結合性（破れの初出は mat2⟨𝕆⟩）。
+- **事前証明モード** (`tot="auto"`): 演算前の範囲検査1回で「級数中に事故は起き得ない」を証明したら内部検査を省略（ビット一致のまま税 3.19×→1.41×）。サブノーマル濃度が数%を超える CPU データでは素の IEEE より**速くなる**（100%で3.03×・全域側は濃度非依存フラット＝定時性）。
 
 **正直な但し書き**: フラグは*全域化イベントのみ*（`±MAX`/`ε`飽和・0除算）。float32の最近接丸めはフラグしない（方向を持たず片側境界にできないため）。
 
-**総ビリニア機械（TBM）**: 本リポの部品は1つの機械に組み上がる（[TBM_SPEC.md](TBM_SPEC.md)）。掛け算する命令は `Wᵀ((U·a)⊙(V·b))` ただ1つ・全6命令、exp/solve/FFT/法則発見は全部「プログラム（マクロ）」。全命令が誠実さのダイヤル（証拠級/粗/裸）を持つ——誠実さの税金は一枚岩でなく傾斜だから（実測: 証拠級は制御ループ帯でタダ・大バッチ37×、粗は1.13×≒タダ）。`tbm.py` がアセンブラ、`run_everywhere.py` が適合試験で、**同じプログラムが CPU / GPU（融合Triton）/ 自動生成SystemVerilogゲート（RTLシミュ）で値・フラグともbit一致**（敵対的Inf/NaN注入込み・2026-07-21合格）。*Compile once, run on three silicons, never lie.*
-###研究利用と再現性
-このソフトウェアは、通常の浮動小数点演算とは異なる全域化、状態伝播、特異点処理、および検査規則を実装しています。
-これらの演算意味論が研究結果に影響する場合、再現性を確保するため、本リポジトリのURL、使用したコミットID、および結果に影響する演算設定を研究成果中に明記することをおすすめします。
+**総ビリニア機械（TBM）**: 全6命令（掛け算はBILIN 1つ——「掛け算しかできない」ではなく「掛け算の意味論は1つで足りる」の意）。exp/solve/FFT/法則発見は全部「プログラム（マクロ）」。全命令が誠実さのダイヤル（証拠級/粗/裸）を持つ——誠実さの税金は一枚岩でなく傾斜だから（実測: 証拠級は制御ループ帯でタダ・大バッチ37×、粗は1.13×≒タダ）。`tbm.py` がアセンブラ、`run_everywhere.py` が適合試験で、**同じプログラムが CPU / GPU（融合Triton）/ 自動生成SystemVerilogゲート（RTLシミュ）で値・フラグともbit一致**（敵対的Inf/NaN注入込み・2026-07-21合格）。*Compile once, run on three silicons, never lie.*
+
 ### 再現方法
 
 上記コマンド。RTX 5090 実測値は上段の通り。CUDA GPU 必須（CPUフォールバックは正しさは保つがスループット値は出ない）。
