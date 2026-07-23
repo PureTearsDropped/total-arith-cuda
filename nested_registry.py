@@ -327,42 +327,63 @@ def _action_op(A, name, x, mode):
     ok = fin and imag < 1e-8 and rec < 1e-8 * (1.0 + float(np.abs(Mx).max())) and resid < 1e-6
     return y if ok else Nel(y.c, y.flag | INEXACT)
 
-_BOPS = ("add", "sub", "mul", "div")
+_BOPS = ("add", "sub", "mul", "div", "comm", "anti")
+
+BPENCIL = {"mul": (1.0, 0.0), "sym": (0.5, 0.5), "comm": (1.0, -1.0), "anti": (1.0, 1.0)}
+
+def bop(A, spec, x, y, path="cell"):
+    """二項演算の **自動生成器**: 種類 = ペンシル係数 (α,β) (名前 or 任意の実対)、経路 = path。
+       演算 f(x,y) = α·x·y + β·y·x、作用素は ペンシル P_x = α·L_x + β·R_x。
+       path: cell (胞の積2回) / action (P_x·y を 行列で) /
+             solve (逆演算: P_a·q = b を 擬似逆+二層検証 — 特異 → 最小二乗+SING) /
+             solve_inv (真の逆行列 — 特異なら 解を 捏造せず INEXACT)。
+       mul=(1,0)・右積=(0,1)・Jordan=(½,½)・交換子=(1,−1)・反交換子=(1,1) は 座標にすぎない —
+       任意の (α,β) (例: q変形 (1,−q)) で 演算も 逆演算も 検証つきで 自動に 生まれる。
+       恒等式 (cell≡action 等) は 仮定せず 測って 主張。"""
+    al, be = BPENCIL[spec] if isinstance(spec, str) else (float(spec[0]), float(spec[1]))
+    if path == "cell":
+        return tadd(tscale(tmul(A, x, y), al), tscale(tmul(A, y, x), be))
+    Mo = al * Lmat(A, x.c) + be * Rmat(A, x.c)
+    if path == "action":
+        return _tot(Mo @ y.c, x.flag | y.flag)
+    if path == "solve":
+        qv = np.linalg.lstsq(Mo, y.c, rcond=None)[0]
+        r1 = float(np.abs(Mo @ qv - y.c).max())
+        r2 = float(np.abs(Mo.T @ (Mo @ qv - y.c)).max())
+        f = x.flag | y.flag
+        f = f if r1 < 1e-8 else (f | SING if r2 < 1e-8 else f | SING | INEXACT)
+        return _tot(qv, f)
+    if path == "solve_inv":
+        with np.errstate(all="ignore"):
+            try:
+                qv = np.linalg.inv(Mo) @ y.c
+            except np.linalg.LinAlgError:
+                qv = np.full(A.dim, np.nan)
+        q = _tot(qv, x.flag | y.flag)
+        resid = float(np.abs(Mo @ q.c - y.c).max()) if np.isfinite(q.c).all() else np.inf
+        return q if resid < 1e-8 else Nel(q.c, q.flag | SING | INEXACT)
+    raise KeyError(path)
 
 def _binary_op(A, name, x, y, bracket):
-    """二項演算を 単項の OPS と 同じ棚・同じ規約に (レベルの 段差を 消す)。五モードは
-       **別実装のまま 分ける** — 恒等式 (L_x·y = x·y 等) は 仮定せず、一致は 測って 主張:
-       add/sub = 厳密 (全域 val,flag)
-       mul: left=x·y(胞) / right=y·x(胞) / sym=Jordan (x·y+y·x)/2 /
-            laction=L_x·y(作用素行列) / raction=R_x·y(作用素行列)
-       div (div(a,b): left は a·q=b / right は q·a=b / sym は (a·q+q·a)/2=b):
-            left/right/sym = nsolve = 擬似逆+二層検証 (特異 → 最小二乗解+SING) /
-            laction/raction = 作用素行列の **真の逆行列** で 解く 候補 (正則なら 厳密・
-            特異なら 解を 捏造せず INEXACT) — 擬似逆と 真逆は 零因子で 別物。"""
+    """nop の 二項入口 — (名前, モード) を bop 生成器の 座標 (ペンシル, 経路) に 写すだけ。
+       写像規則 (五モードは 別経路のまま): left = (α,β) 胞 / right = (β,α) 胞 (引数入替 =
+       係数入替) / sym = 平均ペンシル 胞 / laction = (α,β) 作用行列 / raction = (β,α) 作用行列。
+       div は solve 経路: left/right/sym = 擬似逆 / laction/raction = 真の逆。
+       帰結の例: comm の sym = ペンシル (0,0) = 0 (対称化は 反対称を 消す — 線形な 帳簿の 定理)。"""
     if name == "add":
         return tadd(x, y)
     if name == "sub":
         return tadd(x, tscale(y, -1.0))
-    if name == "mul":
-        if bracket == "left":
-            return tmul(A, x, y)
-        if bracket == "right":
-            return tmul(A, y, x)
-        if bracket == "sym":
-            return tscale(tadd(tmul(A, x, y), tmul(A, y, x)), 0.5)
-        Mo = Lmat(A, x.c) if bracket == "laction" else Rmat(A, x.c)
-        return _tot(Mo @ y.c, x.flag | y.flag)
-    if bracket in ("left", "right", "sym"):
-        return nsolve(A, x, y, bracket)[0]
-    Mo = Lmat(A, x.c) if bracket == "laction" else Rmat(A, x.c)
-    with np.errstate(all="ignore"):
-        try:
-            qv = np.linalg.inv(Mo) @ y.c
-        except np.linalg.LinAlgError:
-            qv = np.full(A.dim, np.nan)
-    q = _tot(qv, x.flag | y.flag)
-    resid = float(np.abs(Mo @ q.c - y.c).max()) if np.isfinite(q.c).all() else np.inf
-    return q if resid < 1e-8 else Nel(q.c, q.flag | SING | INEXACT)
+    if name == "div":
+        pen = {"left": (1.0, 0.0), "right": (0.0, 1.0), "sym": (0.5, 0.5),
+               "laction": (1.0, 0.0), "raction": (0.0, 1.0)}[bracket]
+        path = "solve" if bracket in ("left", "right", "sym") else "solve_inv"
+        return bop(A, pen, x, y, path)
+    al, be = BPENCIL["mul"] if name == "mul" else BPENCIL[name]
+    pen = {"left": (al, be), "right": (be, al), "sym": ((al + be) / 2, (al + be) / 2),
+           "laction": (al, be), "raction": (be, al)}[bracket]
+    path = "action" if bracket in ("laction", "raction") else "cell"
+    return bop(A, pen, x, y, path)
 
 def nop(A, name, x, y=None, order=None, bracket="left"):
     """run any preset on any Alg — forward: total; candidate: verified or INEXACT。
@@ -842,6 +863,31 @@ def self_test():
     print(f"二項も同棚: add/sub 厳密 ✓ ; mul 五モード別実装 (ℍ left≠right {ncom:.2f}・sym=平均・"
           f"laction/raction 一致は測って {dml:.0e}) ✓ ; div 五モード (擬似逆3面 vs 真逆2面 — "
           f"零因子で SING/INEXACT に 分岐・mat2⟨ℍ⟩ too) ✓ — 四則+超越が 同じ棚・同じ規約")
+    # --- bop 生成器: 演算 = ペンシル座標 (α,β) × 経路 — 列挙でなく 自動生成 ---
+    cm = nop(H, "comm", xh, yh)                              # 交換子 [x,y] = ペンシル (1,−1)
+    assert np.abs(cm.c - (rawmul(H, xh.c, yh.c) - rawmul(H, yh.c, xh.c))).max() < 1e-12
+    assert np.abs(nop(H, "comm", xh, yh, bracket="laction").c - cm.c).max() < 1e-12  # ad_x=L−R (測る)
+    assert np.abs(nop(H, "comm", xh, yh, bracket="right").c + cm.c).max() < 1e-12    # 反対称
+    assert np.abs(nop(H, "comm", xh, yh, bracket="sym").c).max() == 0.0   # 対称化は 反対称を 消す
+    at = nop(H, "anti", xh, yh)                              # 反交換子 {x,y} = ペンシル (1,1) = L+R
+    assert np.abs(at.c - 2.0 * nop(H, "mul", xh, yh, bracket="sym").c).max() < 1e-12  # = 2·Jordan
+    assert np.abs(nop(H, "anti", xh, yh, bracket="raction").c - at.c).max() < 1e-12   # 対称=全モード一致
+    q21 = bop(H, (2.0, -1.0), xh, yh, "cell")                # 任意ペンシル: 名前の ない 演算too 自動
+    assert np.abs(q21.c - bop(H, (2.0, -1.0), xh, yh, "action").c).max() < 1e-12
+    s21 = bop(H, (2.0, -1.0), xh, yh, "solve")               # その 逆演算 (2·x·q−q·x=y) too 自動
+    assert np.abs(bop(H, (2.0, -1.0), xh, s21, "cell").c - yh.c).max() < 1e-8
+    assert not (s21.flag & SING)
+    csv = bop(H, "comm", xh, yh, "solve")                    # [x,q]=y は ad が 特異 (中心核) →
+    assert csv.flag & SING                                   # 解を 捏造せず 最小二乗+SING を 宣言
+    adx = Lmat(H, xh.c) - Rmat(H, xh.c)                      # 随伴表現: exp(ad_x) = Ad_{exp x} を 測る
+    wad, Vad = np.linalg.eig(adx)
+    Adm = np.real((Vad * np.exp(wad)) @ np.linalg.inv(Vad))
+    conj = rawmul(H, rawmul(H, nop(H, "exp", xh).c, yh.c), nop(H, "exp", tscale(xh, -1.0)).c)
+    dad = float(np.abs(Adm @ yh.c - conj).max())
+    assert dad < 1e-6
+    print(f"bop生成器: comm=(1,−1) (ad=L−R・反対称・対称化で0) ✓ ; anti=(1,1)=L+R=2·Jordan ✓ ; "
+          f"任意ペンシル(2,−1) 胞≡作用・逆演算too自動 ✓ ; [x,q]=y は SING宣言 ✓ ; "
+          f"exp(ad_x)=Ad_exp(x) 随伴表現 {dad:.0e} ✓ — 演算は 列挙でなく (種類,経路) の 座標から 生成")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)
