@@ -417,26 +417,29 @@ function nop(A::Alg, name::Symbol, x::Nel; order::Union{Int,Nothing} = nothing,
     resid < 1e-6 ? y : Nel(y.c, y.flag | INEXACT)
 end
 
-"""二項演算を 単項と 同じ棚に (python _binary_op の 双子)。五モードは **別実装のまま
-   分ける** — 恒等式 (L_x·y = x·y 等) は 仮定せず 一致は 測って 主張:
-   :add/:sub = 厳密 / :mul = left(胞)/right(胞)/sym(Jordan)/laction(L_x·y)/raction(R_x·y) /
-   :div = left/right/sym は nsolve(擬似逆+二層検証・特異→SING) / laction/raction は
-   作用素行列の **真の逆行列** (正則なら 厳密・特異なら 捏造せず INEXACT)。"""
-function nop(A::Alg, name::Symbol, x::Nel, y::Nel; bracket::Symbol = :left)
-    name === :add && return tadd(x, y)
-    name === :sub && return tadd(x, tscale(y, -1.0))
-    if name === :mul
-        bracket === :left && return tmul(A, x, y)
-        bracket === :right && return tmul(A, y, x)
-        bracket === :sym && return tscale(tadd(tmul(A, x, y), tmul(A, y, x)), 0.5)
-        Mo = bracket === :laction ? Lmat_alg(A, x.c) : Rmat_alg(A, x.c)
-        return _tot(Mo * y.c, x.flag | y.flag)
+const BPENCIL = Dict{Symbol,NTuple{2,Float64}}(:mul => (1.0, 0.0), :sym => (0.5, 0.5),
+                                               :comm => (1.0, -1.0), :anti => (1.0, 1.0))
+
+"""二項演算の **自動生成器** (python bop の 双子): 種類 = ペンシル係数 (α,β)、経路 = path。
+   演算 f(x,y) = α·x·y + β·y·x、作用素は ペンシル P_x = α·L_x + β·R_x。
+   path: :cell (胞の積2回) / :action (P_x·y を 行列で) / :solve (逆演算 P_a·q=b を
+   乗算のみ Ben-Israel 擬似逆+二層検証 — 特異 → 最小二乗+SING) / :solve_inv (真の逆行列 —
+   特異なら 捏造せず INEXACT)。mul=(1,0)・Jordan=(½,½)・交換子=(1,−1)・反交換子=(1,1) は
+   座標にすぎず、任意の (α,β) で 演算も 逆演算も 検証つきで 自動に 生まれる。"""
+function bop(A::Alg, spec, x::Nel, y::Nel; path::Symbol = :cell)
+    (al, be) = spec isa Symbol ? BPENCIL[spec] : (Float64(spec[1]), Float64(spec[2]))
+    path === :cell && return tadd(tscale(tmul(A, x, y), al), tscale(tmul(A, y, x), be))
+    Mo = al .* Lmat_alg(A, x.c) .+ be .* Rmat_alg(A, x.c)
+    path === :action && return _tot(Mo * y.c, x.flag | y.flag)
+    if path === :solve
+        qv = _pinv_mul(Mo, 30) * y.c
+        r1 = maximum(abs.(Mo * qv .- y.c))
+        r2 = maximum(abs.(Mo' * (Mo * qv .- y.c)))
+        f = x.flag | y.flag
+        f = r1 < 1e-8 ? f : (r2 < 1e-8 ? f | SING : f | SING | INEXACT)
+        return _tot(qv, f)
     end
-    if name === :div
-        bracket === :left && return nsolve_left(A, x, y)[1]
-        bracket === :right && return nsolve_right(A, x, y)[1]
-        bracket === :sym && return nsolve_sym(A, x, y)[1]
-        Mo = bracket === :laction ? Lmat_alg(A, x.c) : Rmat_alg(A, x.c)
+    if path === :solve_inv
         qv = try
             inv(Mo) * y.c
         catch
@@ -446,7 +449,26 @@ function nop(A::Alg, name::Symbol, x::Nel, y::Nel; bracket::Symbol = :left)
         resid = all(isfinite, q.c) ? maximum(abs.(Mo * q.c .- y.c)) : Inf
         return resid < 1e-8 ? q : Nel(q.c, q.flag | SING | INEXACT)
     end
-    error("二項棚に ない 演算: $name")
+    error("bop path: $path")
+end
+
+"""nop の 二項入口 — (名前, モード) を bop 座標 (ペンシル, 経路) に 写すだけ。写像規則:
+   left=(α,β)胞 / right=(β,α)胞 (引数入替=係数入替) / sym=平均ペンシル胞 / laction=(α,β)作用 /
+   raction=(β,α)作用。:div は solve 経路 (左右対称=擬似逆 / laction/raction=真逆)。
+   帰結: comm の sym = (0,0) = 0 — 対称化は 反対称を 消す (線形な 帳簿の 定理)。"""
+function nop(A::Alg, name::Symbol, x::Nel, y::Nel; bracket::Symbol = :left)
+    name === :add && return tadd(x, y)
+    name === :sub && return tadd(x, tscale(y, -1.0))
+    if name === :div
+        pen = bracket === :left ? (1.0, 0.0) : bracket === :right ? (0.0, 1.0) :
+              bracket === :sym ? (0.5, 0.5) : bracket === :laction ? (1.0, 0.0) : (0.0, 1.0)
+        return bop(A, pen, x, y; path = bracket in (:left, :right, :sym) ? :solve : :solve_inv)
+    end
+    (al, be) = BPENCIL[name]
+    pen = bracket === :left ? (al, be) : bracket === :right ? (be, al) :
+          bracket === :sym ? ((al + be) / 2, (al + be) / 2) :
+          bracket === :laction ? (al, be) : (be, al)
+    bop(A, pen, x, y; path = bracket in (:laction, :raction) ? :action : :cell)
 end
 
 "print the preset shelf: name, kind, and what the candidate verification checks"
@@ -1085,6 +1107,20 @@ function self_test()
     @assert (flagof(nop(A16z, :div, zd16, bz; bracket = :laction)) & INEXACT) != 0  # 真逆 → INEXACT
     println("二項も同棚: add/sub 厳密 ✓ ; mul 五モード別実装 (left≠right・laction一致は測る) ✓ ; ",
             "div 擬似逆3面 vs 真逆2面 — 零因子で SING/INEXACT 分岐 ✓")
+    # --- bop 生成器: 演算 = ペンシル (α,β) × 経路 の 座標から 自動生成 ---
+    cmj = nop(H4, :comm, xh, yh)
+    @assert maximum(abs.(coeffs(cmj) .- (rawmul(H4, xh.c, yh.c) .- rawmul(H4, yh.c, xh.c)))) < 1e-12
+    @assert maximum(abs.(coeffs(nop(H4, :comm, xh, yh; bracket = :laction)) .- coeffs(cmj))) < 1e-12
+    @assert maximum(abs.(coeffs(nop(H4, :comm, xh, yh; bracket = :sym)))) == 0.0   # 対称化は 反対称を 消す
+    atj = nop(H4, :anti, xh, yh)
+    @assert maximum(abs.(coeffs(atj) .- 2.0 .* coeffs(nop(H4, :mul, xh, yh; bracket = :sym)))) < 1e-12
+    q21 = bop(H4, (2.0, -1.0), xh, yh)                       # 名前の ない 演算too 座標から 自動
+    @assert maximum(abs.(coeffs(q21) .- coeffs(bop(H4, (2.0, -1.0), xh, yh; path = :action)))) < 1e-12
+    s21 = bop(H4, (2.0, -1.0), xh, yh; path = :solve)        # 逆演算 (2·x·q−q·x=y) too 自動
+    @assert maximum(abs.(coeffs(bop(H4, (2.0, -1.0), xh, s21)) .- yh.c)) < 1e-7
+    @assert (flagof(bop(H4, :comm, xh, yh; path = :solve)) & SING) != 0  # [x,q]=y: ad特異 → SING宣言
+    println("bop生成器: comm=(1,−1)=ad=L−R ✓ ; anti=(1,1)=2·Jordan ✓ ; 任意ペンシル(2,−1) ",
+            "胞≡作用・逆演算too自動 ✓ ; [x,q]=y は SING宣言 ✓ — 演算は (種類,経路) の 座標から 生成")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 
