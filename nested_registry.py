@@ -350,6 +350,17 @@ def impl_kron(a, b):
        the tensor-product algebra, with R = R_a·R_b — the UVW mirror of tensor(A,B)."""
     return Impl(f"{a.name}⊗{b.name}", np.kron(a.U, b.U), np.kron(a.V, b.V), np.kron(a.W, b.W))
 
+def prune_impl(im):
+    """死に積の刈り込み (出力不変): U/V/W の行が全0の積 r を落とす。naive_impl は生成時に
+       非零 (i,j) しか拾わない=生まれつき刈り込み済なので、これは合成・手書き (U,V,W) 用。
+       方針: 併合はしない — 順序無視の併合は反対称部(=非可換の住処)を消し、可換代数でも
+       a_i·b_j ≠ a_j·b_i で壊れる (2026-07-23 実測・total-arith-hardware の prune_uvw と同方針)。"""
+    keep = [r for r in range(im.R)
+            if np.any(im.U[r]) and np.any(im.V[r]) and np.any(im.W[r])]
+    if len(keep) == im.R:
+        return im
+    return Impl(f"{im.name}∖dead", im.U[keep], im.V[keep], im.W[keep])
+
 def _gauss_cd2():
     "complex multiply in 3 real multiplications (Gauss/Karatsuba) instead of 4"
     return Impl("gauss⟨cd2⟩", U=[[1, 0], [0, 1], [1, 1]], V=[[1, 0], [0, 1], [1, 1]],
@@ -642,6 +653,15 @@ def self_test():
     print(f"kron composition: gauss⊗gauss computes cd2⊗cd2 exactly with R=9 (naive 16) ✓")
     print(f"cost of exp on cd2 (order 20 = 20 products): naive {20 * impl('complex_naive').R}"
           f" mults vs gauss {20 * impl('complex_gauss').R} mults — same answer, verified same T")
+    # 死に積の門番: 棚は全員 刈り込み済 (prune が no-op)・人工死に積は落ちて T 厳密のまま
+    for nm in IMPLS:
+        assert prune_impl(impl(nm)).R == impl(nm).R, f"棚に死に積: {nm}"
+    imc = impl("complex_gauss")
+    dead = Impl("gauss+dead", np.vstack([imc.U, [1, 1]]), np.vstack([imc.V, [1, -1]]),
+                np.vstack([imc.W, [0, 0]]))                    # W行=0 → どの出力too不使用
+    imp = prune_impl(dead)
+    assert imp.R == 3 and impl_verify(imp, cd_alg(2)) < 1e-12
+    print(f"死に積: 棚 {len(IMPLS)} 種 prune no-op ✓ ; 人工死に積 R 4→3・ΣUVW≡T のまま ✓ (併合はしない)")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)

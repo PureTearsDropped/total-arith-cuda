@@ -610,6 +610,55 @@ function commut_defect(A::Alg; trials::Int = 4, rng = nothing)
     worst
 end
 
+# ================================================================ UVW algorithms (IMPLS の双子・最小)
+#  同じ代数 T を 別の (U,V,W) で 計算する: c = Wᵀ((Ux)⊙(Vy))・R = 実乗算の本数。
+#  正しさは テンソル方程式 Σ_r U[r,i]·V[r,j]·W[r,k] ≡ T[i,j,k] を 測って 主張(仮定しない)。
+struct Impl
+    name::String
+    U::Matrix{Float64}
+    V::Matrix{Float64}
+    W::Matrix{Float64}
+end
+implR(im::Impl) = size(im.U, 1)
+
+function impl_verify(im::Impl, A::Alg)
+    worst = 0.0
+    for i in 1:A.dim, j in 1:A.dim, k in 1:A.dim
+        s = 0.0
+        for r in 1:implR(im)
+            s += im.U[r, i] * im.V[r, j] * im.W[r, k]
+        end
+        worst = max(worst, abs(s - A.tab[i][j][k]))
+    end
+    worst
+end
+
+impl_mul(im::Impl, x, y) = im.W' * ((im.U * x) .* (im.V * y))
+
+function naive_impl(A::Alg)
+    # 非零 (i,j) だけ 拾う = 生まれつき 死に積なし (dual/Grassmann の 0 は 行にならない)
+    rows = [(i, j) for i in 1:A.dim for j in 1:A.dim if any(!=(0.0), A.tab[i][j])]
+    R = length(rows)
+    U = zeros(R, A.dim); V = zeros(R, A.dim); W = zeros(R, A.dim)
+    for (r, (i, j)) in enumerate(rows)
+        U[r, i] = 1.0; V[r, j] = 1.0; W[r, :] = A.tab[i][j]
+    end
+    Impl("naive⟨" * A.name * "⟩", U, V, W)
+end
+
+function prune_impl(im::Impl)
+    # 死に積の刈り込み(出力不変): U/V/W の 行が 全0 の 積 r を 落とす。方針: 併合は しない —
+    # 順序無視の 併合は 反対称部(=非可換の住処)を 消し、可換代数でも a_i·b_j ≠ a_j·b_i で
+    # 壊れる(2026-07-23 実測・total-arith-hardware の prune_uvw と 同方針)。
+    keep = [r for r in 1:implR(im)
+            if any(!=(0.0), im.U[r, :]) && any(!=(0.0), im.V[r, :]) && any(!=(0.0), im.W[r, :])]
+    length(keep) == implR(im) && return im
+    Impl(im.name * "∖dead", im.U[keep, :], im.V[keep, :], im.W[keep, :])
+end
+
+gauss_impl() = Impl("gauss⟨cd2⟩", [1.0 0; 0 1; 1 1], [1.0 0; 0 1; 1 1],
+                    [1.0 -1; -1 -1; 0 1])
+
 mutable struct _LCG; s::UInt64; end
 _lcg() = _LCG(0x9E3779B97F4A7C15)
 function rand_vec(g::_LCG, n)
@@ -905,6 +954,23 @@ function self_test()
                 k -> iseven(k) ? Float64((-1)^(k ÷ 2) / (factorial(big(k ÷ 2))^2 * big(2)^k)) : 0.0)
     @assert all(isfinite, coeffs(j0))
     println("custom tape (user-defined coefficients) on cd4 ✓ — O layer is open, not an enum")
+    # --- UVW/IMPLS 最小双子: テンソル方程式・死に積の刈り込み(併合はしない) ---
+    A2 = cd_alg(2)
+    gim = gauss_impl()
+    @assert impl_verify(gim, A2) < 1e-12 && implR(gim) == 3       # Gauss 3積 ≡ 複素積
+    @assert impl_verify(naive_impl(A2), A2) < 1e-12
+    gg = _lcg()
+    x2, y2 = rand_vec(gg, 2), rand_vec(gg, 2)
+    @assert maximum(abs.(impl_mul(gim, x2, y2) .- rawmul(A2, x2, y2))) < 1e-12
+    G2 = grassmann_alg(2)
+    ng = naive_impl(G2)                                           # 表の 0 は 行にならない
+    @assert implR(ng) == 9 && impl_verify(ng, G2) < 1e-12         # 16 でなく 9 (生まれつき刈り込み)
+    dead = Impl("gauss+dead", vcat(gim.U, [1.0 1.0]), vcat(gim.V, [1.0 -1.0]),
+                vcat(gim.W, [0.0 0.0]))                           # W行=0 → どの出力too不使用
+    pim = prune_impl(dead)
+    @assert implR(pim) == 3 && impl_verify(pim, A2) < 1e-12
+    println("UVW双子: gauss R=3 ≡ cd2 ✓ ; naive⟨Λ2⟩ R=9(16でなく=死に積なし) ✓ ; ",
+            "人工死に積 R 4→3・ΣUVW≡T のまま ✓ (併合はしない)")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 
