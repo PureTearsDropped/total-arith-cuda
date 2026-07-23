@@ -220,14 +220,24 @@ def fused_ekernel(name, x, order=None, tot=True):
     """cuda_total.ekernel_gpu の 融合版: 級数 全段 + 全域化が レジスタ内で 完結し、HBM は
        入出力の 1 往復だけ (未融合は 級数 1 段 ≈ カーネル 数個 × order)。契約: 値・成分ごと旗
        とも ekernel_gpu と ビット一致 (self_test が 恒久検査) — つまり numpy ekernel とも 一致。
-       tot=False は 全域化なしの 対照 (誠実さ税の 測定用)。candidate の 検算は 出口で 数パス。"""
+       tot=False は 全域化なしの 対照 (誠実さ税の 測定用)。candidate の 検算は 出口で 数パス。
+       **自作テープtoo 融合で 走る**: name に (キー文字列, テープ関数, 次数, shift) の 組を
+       渡すと 任意の 級数 (合成式の テイラー係数 等) が 同じ 1 パス評価器に 載る — O 層の
+       開放が 融合カーネルまで 通る (torch は 関数ごとに 専用カーネルだが、こちらは 評価器
+       1 個 × テープ差し替え)。"""
     from nested_registry import OPS
     from cuda_total import _tot64
-    op = OPS[name]
-    ordr = order or op["order"]
-    key = (name, ordr)
+    if isinstance(name, (tuple, list)):
+        keyname, tapefn, ordr, shift = name
+        kind = "forward"
+    else:
+        op = OPS[name]
+        keyname, tapefn = name, op["tape"]
+        ordr = order or op["order"]
+        shift, kind = bool(op["shift"]), op["kind"]
+    key = (keyname, ordr)
     if key not in _EK_COEFS:
-        _EK_COEFS[key] = torch.tensor([float(op["tape"](k)) for k in range(ordr + 1)],
+        _EK_COEFS[key] = torch.tensor([float(tapefn(k)) for k in range(ordr + 1)],
                                       dtype=torch.float64, device="cuda")
     xT = x if torch.is_tensor(x) else torch.as_tensor(
         __import__("numpy").asarray(x, float), dtype=torch.float64, device="cuda")
@@ -236,9 +246,9 @@ def fused_ekernel(name, x, order=None, tot=True):
     of = torch.empty(n, dtype=torch.uint8, device=xT.device)
     BLOCK = 1024
     _ekernel_kernel[((n + BLOCK - 1) // BLOCK,)](
-        xT, _EK_COEFS[key], ov, of, n, ORDER=ordr, SHIFT=bool(op["shift"]),
+        xT, _EK_COEFS[key], ov, of, n, ORDER=ordr, SHIFT=shift,
         TOT=bool(tot), BLOCK=BLOCK)
-    if op["kind"] == "forward" or not tot:
+    if kind == "forward" or not tot:
         return ov, of
     vt, _ = _tot64(xT, torch.zeros(n, dtype=torch.uint8, device=xT.device))
     if name == "log":
