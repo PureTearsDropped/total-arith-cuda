@@ -24,18 +24,24 @@ MAX = torch.finfo(F32).max            # 飽和天井
 MIN = torch.finfo(F32).tiny           # ε = 最小正規数（向き付き 無限小）
 
 
-def _sat(raw64, dev):
+def _sat(raw64, dev, MAXd=None, MINd=None):
     """float64 の 生値 → (float32 値, フラグ)。溢れ→±MAX+GE / 潰れ→±MIN+LE / NaN 出さない。
-       NaN 入力は (0, 境界なし+SUNK) に 全域化（外部AI監査 2026-07-19 の 指摘で 追加）。"""
+       NaN 入力は (0, 境界なし+SUNK) に 全域化（外部AI監査 2026-07-19 の 指摘で 追加）。
+       MAXd/MINd: **宣言ドメイン** — 境界を 機械の 都合 (f32) でなく 対象の 仕様で 置く
+       (センサの ±16g・アクチュエータの レール等)。GE=クリップは 実機の ネイティブ意味論
+       (PX4 ログ実験の 教訓)。既定は 機械ドメイン (f32 全域数)。"""
+    MAXd = MAX if MAXd is None else float(MAXd)
+    MINd = MIN if MINd is None else float(MINd)
+    assert 0.0 < MINd < MAXd <= MAX, "宣言ドメインは 0 < min < max ≤ f32MAX"
     nan = torch.isnan(raw64)
     raw64 = torch.where(nan, torch.zeros_like(raw64), raw64)
     sign = torch.sign(raw64)
     a = raw64.abs()
-    over = a > MAX                                   # inf も ここで 捕まる
-    under = (a > 0) & (a < MIN)
+    over = a > MAXd                                  # inf も ここで 捕まる
+    under = (a > 0) & (a < MINd)
     val = raw64.clone()
-    val = torch.where(over, sign * MAX, val)
-    val = torch.where(under, sign * MIN, val)
+    val = torch.where(over, sign * MAXd, val)
+    val = torch.where(under, sign * MINd, val)
     flag = torch.zeros(raw64.shape, dtype=torch.uint8, device=dev)
     flag |= over.to(torch.uint8) * GE
     flag |= under.to(torch.uint8) * LE
@@ -55,9 +61,12 @@ class Tot:
        呼び出し側の 責任で、検査しない（演算関数が 生成する 値は 常に 全域化済み）。
        外部からは Tot(x) の 1 引数形を 使うこと。"""
     __slots__ = ('val', 'flag')
-    def __init__(self, val, flag=None):
+    def __init__(self, val, flag=None, max=None, min=None):
         if flag is None:
-            self.val, self.flag = _sat(val.double(), val.device)
+            # max/min: 宣言ドメイン (入口税関の 境界を 対象の 仕様で 置く)。値は 元の 単位の
+            # まま ±max に クランプ+GE / ±min に 持ち上げ+LE — センサの クリップ・レール
+            # そのもの。以後の 演算は 機械ドメインで 走り、旗だけが 事実を 運ぶ。
+            self.val, self.flag = _sat(val.double(), val.device, max, min)
         else:
             self.val = val.to(F32)
             self.flag = flag
@@ -387,6 +396,20 @@ def self_test():
     reg_ok = int(rr.flag.item()) == (GE | LE | SUNK)
     print(f"  (+MIN,LE)+(−MIN,=): flag={int(rr.flag.item())} = 境界なし+SUNK {'✓' if reg_ok else '×（旧版: LE=嘘）'}")
     assert ok_entry and zok and reg_ok
+    # 宣言ドメイン: 境界を 対象の 仕様で 置く (例: 加速度計 ±16g)。クリップ→GE・微小→±min+LE・
+    # NaN→0+全旗。値は 元の 単位のまま (センサの レール 挙動 そのもの)。
+    g16 = 16 * 9.8
+    sens = Tot(torch.tensor([9.8, 1e8, -1e8, float('nan'), 1e-9], dtype=torch.float64,
+                            device=dev), max=g16, min=1e-6)
+    dv, df = sens.val.tolist(), sens.flag.tolist()
+    dom_ok = (df[0] == 0 and abs(dv[0] - 9.8) < 1e-5                    # 正常値は 素通り
+              and df[1] == GE and abs(dv[1] - g16) < 1e-3               # スパイク → +16g+GE
+              and df[2] == GE and abs(dv[2] + g16) < 1e-3               # 負スパイク → −16g+GE
+              and df[3] == (GE | LE | SUNK) and dv[3] == 0.0            # NaN → 0+全旗
+              and df[4] == LE and abs(dv[4] - 1e-6) < 1e-12)            # 微小 → min+LE
+    print(f"  宣言ドメイン Tot(x, max=16g): 正常素通り/スパイク→±16g+GE/NaN→0+全旗/微小→min+LE"
+          f" {'✓' if dom_ok else '×'}")
+    assert dom_ok
 
     print()
     print("=" * 76)
