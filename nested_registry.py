@@ -327,10 +327,52 @@ def _action_op(A, name, x, mode):
     ok = fin and imag < 1e-8 and rec < 1e-8 * (1.0 + float(np.abs(Mx).max())) and resid < 1e-6
     return y if ok else Nel(y.c, y.flag | INEXACT)
 
-def nop(A, name, x, order=None, bracket="left"):
+_BOPS = ("add", "sub", "mul", "div")
+
+def _binary_op(A, name, x, y, bracket):
+    """二項演算を 単項の OPS と 同じ棚・同じ規約に (レベルの 段差を 消す)。五モードは
+       **別実装のまま 分ける** — 恒等式 (L_x·y = x·y 等) は 仮定せず、一致は 測って 主張:
+       add/sub = 厳密 (全域 val,flag)
+       mul: left=x·y(胞) / right=y·x(胞) / sym=Jordan (x·y+y·x)/2 /
+            laction=L_x·y(作用素行列) / raction=R_x·y(作用素行列)
+       div (div(a,b): left は a·q=b / right は q·a=b / sym は (a·q+q·a)/2=b):
+            left/right/sym = nsolve = 擬似逆+二層検証 (特異 → 最小二乗解+SING) /
+            laction/raction = 作用素行列の **真の逆行列** で 解く 候補 (正則なら 厳密・
+            特異なら 解を 捏造せず INEXACT) — 擬似逆と 真逆は 零因子で 別物。"""
+    if name == "add":
+        return tadd(x, y)
+    if name == "sub":
+        return tadd(x, tscale(y, -1.0))
+    if name == "mul":
+        if bracket == "left":
+            return tmul(A, x, y)
+        if bracket == "right":
+            return tmul(A, y, x)
+        if bracket == "sym":
+            return tscale(tadd(tmul(A, x, y), tmul(A, y, x)), 0.5)
+        Mo = Lmat(A, x.c) if bracket == "laction" else Rmat(A, x.c)
+        return _tot(Mo @ y.c, x.flag | y.flag)
+    if bracket in ("left", "right", "sym"):
+        return nsolve(A, x, y, bracket)[0]
+    Mo = Lmat(A, x.c) if bracket == "laction" else Rmat(A, x.c)
+    with np.errstate(all="ignore"):
+        try:
+            qv = np.linalg.inv(Mo) @ y.c
+        except np.linalg.LinAlgError:
+            qv = np.full(A.dim, np.nan)
+    q = _tot(qv, x.flag | y.flag)
+    resid = float(np.abs(Mo @ q.c - y.c).max()) if np.isfinite(q.c).all() else np.inf
+    return q if resid < 1e-8 else Nel(q.c, q.flag | SING | INEXACT)
+
+def nop(A, name, x, y=None, order=None, bracket="left"):
     """run any preset on any Alg — forward: total; candidate: verified or INEXACT。
-       bracket = 五モード {left, right, sym, laction, raction}: 前3つは 胞の級数 (series)、
-       後2つは 作用素行列の 行列関数 (_action_op)。結合的なら 五者一致 (測って主張)。"""
+       単項 (OPS): bracket = 五モード {left, right, sym, laction, raction} — 前3つは
+       胞の級数 (series)、後2つは 作用素行列の 行列関数 (_action_op)。結合的なら 五者一致。
+       二項 (add/sub/mul/div): nop(A, name, x, y) — 同じ棚・同じ規約 (_binary_op)。"""
+    if name in _BOPS:
+        assert y is not None, f"{name} は 二項: nop(A, '{name}', x, y)"
+        return _binary_op(A, name, x, y, bracket)
+    assert y is None, f"{name} は 単項"
     if bracket in ("laction", "raction"):
         return _action_op(A, name, x, bracket)
     op = OPS[name]
@@ -358,6 +400,9 @@ def list_ops():
     for nm in sorted(OPS):
         k = OPS[nm]["kind"]
         print(f"{nm:<7}{'forward (total)' if k == 'forward' else 'candidate (verified or INEXACT)'}")
+    for nm in _BOPS:
+        k = "candidate (nsolve 三面・SING/INEXACT)" if nm == "div" else "forward (total)"
+        print(f"{nm:<7}binary — {k}")
 
 # ================================================================ algebra preset shelf
 ALGS = {
@@ -769,6 +814,34 @@ def self_test():
           f"PSD行列sqrt 作用モードで域外救済 ✓ (級数はINEXACT✓) ; nsolve 左/右/対称 厳密・"
           f"零因子はSING ✓ ; べき結合的なら 五モード一致 (sed16 {sp16:.0e}) / 喪失なら 割れを 宣言 "
           f"(mat2⟨cd16⟩ {dspl:.2f}) ; 恒等式 laction≡right {dEQ:.0e} ✓")
+    # --- 二項も 同じ棚に: nop(A, name, x, y) — add/sub/mul(五モード)/div(三面) ---
+    H = cd_alg(4)
+    xh, yh = nel(H, rng.standard_normal(4)), nel(H, rng.standard_normal(4))
+    assert float(np.abs(nop(H, "add", xh, yh).c - (xh.c + yh.c)).max()) == 0.0
+    assert float(np.abs(nop(H, "sub", xh, yh).c - (xh.c - yh.c)).max()) == 0.0
+    ml, mr = nop(H, "mul", xh, yh), nop(H, "mul", xh, yh, bracket="right")
+    msym = nop(H, "mul", xh, yh, bracket="sym")
+    assert np.abs(ml.c - rawmul(H, xh.c, yh.c)).max() < 1e-15
+    assert np.abs(msym.c - 0.5 * (ml.c + mr.c)).max() < 1e-15
+    ncom = float(np.abs(ml.c - mr.c).max())
+    assert ncom > 0.1                                  # 非可換は mul の left/right の 差に 現れる
+    dml = float(np.abs(nop(H, "mul", xh, yh, bracket="laction").c - ml.c).max())
+    dmr = float(np.abs(nop(H, "mul", xh, yh, bracket="raction").c - mr.c).max())
+    assert dml < 1e-12 and dmr < 1e-12                 # 別実装の 一致 = 測って 主張 (L_x·y=x·y)
+    qd = nop(H, "div", xh, yh)                         # 左除: x·q = y (擬似逆)
+    assert np.abs(rawmul(H, xh.c, qd.c) - yh.c).max() < 1e-9 and not (qd.flag & SING)
+    qda = nop(H, "div", xh, yh, bracket="laction")     # 真の逆 — 正則では 擬似逆と 一致 (測る)
+    assert np.abs(qda.c - qd.c).max() < 1e-9 and not (qda.flag & INEXACT)
+    bz16 = nel(cd_alg(16), rng.standard_normal(16))    # 零因子で 両者は 別物に 分かれる:
+    assert nop(cd_alg(16), "div", zd, bz16).flag & SING                  # 擬似逆 → 最小二乗+SING
+    assert nop(cd_alg(16), "div", zd, bz16, bracket="laction").flag & INEXACT  # 真逆 → 捏造せず INEXACT
+    Mh = mat_over(cd_alg(4), 2)                        # 行列でも 同じ棚が そのまま 効く
+    xm2, ym2 = nel(Mh, rng.standard_normal(16)), nel(Mh, rng.standard_normal(16))
+    qm = nop(Mh, "div", xm2, ym2)
+    assert np.abs(rawmul(Mh, xm2.c, qm.c) - ym2.c).max() < 1e-8
+    print(f"二項も同棚: add/sub 厳密 ✓ ; mul 五モード別実装 (ℍ left≠right {ncom:.2f}・sym=平均・"
+          f"laction/raction 一致は測って {dml:.0e}) ✓ ; div 五モード (擬似逆3面 vs 真逆2面 — "
+          f"零因子で SING/INEXACT に 分岐・mat2⟨ℍ⟩ too) ✓ — 四則+超越が 同じ棚・同じ規約")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)

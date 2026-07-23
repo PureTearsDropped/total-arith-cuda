@@ -417,6 +417,38 @@ function nop(A::Alg, name::Symbol, x::Nel; order::Union{Int,Nothing} = nothing,
     resid < 1e-6 ? y : Nel(y.c, y.flag | INEXACT)
 end
 
+"""二項演算を 単項と 同じ棚に (python _binary_op の 双子)。五モードは **別実装のまま
+   分ける** — 恒等式 (L_x·y = x·y 等) は 仮定せず 一致は 測って 主張:
+   :add/:sub = 厳密 / :mul = left(胞)/right(胞)/sym(Jordan)/laction(L_x·y)/raction(R_x·y) /
+   :div = left/right/sym は nsolve(擬似逆+二層検証・特異→SING) / laction/raction は
+   作用素行列の **真の逆行列** (正則なら 厳密・特異なら 捏造せず INEXACT)。"""
+function nop(A::Alg, name::Symbol, x::Nel, y::Nel; bracket::Symbol = :left)
+    name === :add && return tadd(x, y)
+    name === :sub && return tadd(x, tscale(y, -1.0))
+    if name === :mul
+        bracket === :left && return tmul(A, x, y)
+        bracket === :right && return tmul(A, y, x)
+        bracket === :sym && return tscale(tadd(tmul(A, x, y), tmul(A, y, x)), 0.5)
+        Mo = bracket === :laction ? Lmat_alg(A, x.c) : Rmat_alg(A, x.c)
+        return _tot(Mo * y.c, x.flag | y.flag)
+    end
+    if name === :div
+        bracket === :left && return nsolve_left(A, x, y)[1]
+        bracket === :right && return nsolve_right(A, x, y)[1]
+        bracket === :sym && return nsolve_sym(A, x, y)[1]
+        Mo = bracket === :laction ? Lmat_alg(A, x.c) : Rmat_alg(A, x.c)
+        qv = try
+            inv(Mo) * y.c
+        catch
+            fill(NaN, A.dim)
+        end
+        q = _tot(qv, x.flag | y.flag)
+        resid = all(isfinite, q.c) ? maximum(abs.(Mo * q.c .- y.c)) : Inf
+        return resid < 1e-8 ? q : Nel(q.c, q.flag | SING | INEXACT)
+    end
+    error("二項棚に ない 演算: $name")
+end
+
 "print the preset shelf: name, kind, and what the candidate verification checks"
 function list_ops()
     for (nm, op) in sort(collect(OPS); by = first)
@@ -1034,6 +1066,25 @@ function self_test()
     @assert r1s < 1e-8 && (flagof(ysm) & SING) == 0
     println("表→自動演算: splitquat 五モード exp 一致 ", round(sprd, sigdigits = 2),
             " ✓ ; PSD行列sqrt 作用モードで域外救済 ✓ (級数はINEXACT✓) ; nsolve_sym 厳密 ✓")
+    # --- 二項も 同じ棚に (五モード 別実装・一致は 測る) ---
+    H4 = cd_alg(4)
+    xh = nel(H4, rand_vec(gg, 4)); yh = nel(H4, rand_vec(gg, 4))
+    @assert maximum(abs.(coeffs(nop(H4, :add, xh, yh)) .- (xh.c .+ yh.c))) == 0.0
+    ml = nop(H4, :mul, xh, yh); mr = nop(H4, :mul, xh, yh; bracket = :right)
+    @assert maximum(abs.(coeffs(ml) .- rawmul(H4, xh.c, yh.c))) < 1e-15
+    @assert maximum(abs.(coeffs(ml) .- coeffs(mr))) > 0.01           # 非可換 = left≠right
+    @assert maximum(abs.(coeffs(nop(H4, :mul, xh, yh; bracket = :laction)) .- coeffs(ml))) < 1e-12
+    qd = nop(H4, :div, xh, yh)                                       # 左除 (擬似逆)
+    @assert maximum(abs.(rawmul(H4, xh.c, coeffs(qd)) .- yh.c)) < 1e-8
+    qa = nop(H4, :div, xh, yh; bracket = :laction)                   # 真の逆 — 一致は 測る
+    @assert maximum(abs.(coeffs(qa) .- coeffs(qd))) < 1e-8 && (flagof(qa) & INEXACT) == 0
+    A16z = cd_alg(16)
+    zd16 = nel(A16z, Float64.(1:16 .== 4) .+ Float64.(1:16 .== 11))  # e3+e10 (零因子)
+    bz = nel(A16z, rand_vec(gg, 16))
+    @assert (flagof(nop(A16z, :div, zd16, bz)) & SING) != 0          # 擬似逆 → 最小二乗+SING
+    @assert (flagof(nop(A16z, :div, zd16, bz; bracket = :laction)) & INEXACT) != 0  # 真逆 → INEXACT
+    println("二項も同棚: add/sub 厳密 ✓ ; mul 五モード別実装 (left≠right・laction一致は測る) ✓ ; ",
+            "div 擬似逆3面 vs 真逆2面 — 零因子で SING/INEXACT 分岐 ✓")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 
