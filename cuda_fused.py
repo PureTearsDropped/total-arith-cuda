@@ -163,6 +163,84 @@ def fused_totalize(x) -> Tot:
     return Tot(v.reshape(x.shape), f.reshape(x.shape))
 
 
+# ============================================================ 配線のコンパイラ
+_WCOMP = {}
+
+def compile_wiring(T):
+    """三値配線 T[k,i,j] を **直線コードの Triton カーネルに コンパイル**する。三値契約
+       (TBM_SPEC §1.5) の 配当: 係数は {−1,0,+1} だけなので 生成コードは 符号つき 加算の 列
+       (cd4 = 16 乗算) — 密 einsum の M³ 乗算と カーネル器具代が 消える。意味論は group_mul
+       クリーン経路と 同一: f32 入力 → f64 MAC → 飽和は 最後に 1 回 (_sat と 同じ 規則:
+       溢れ±MAX+GE / 潰れ±MIN+LE / NaN→0+全旗)。コンパイルは 代数ごと 一度・キャッシュ。"""
+    Tc = T.detach().cpu().numpy()
+    M = Tc.shape[0]
+    key = (M, Tc.tobytes())
+    if key in _WCOMP:
+        return _WCOMP[key]
+    L = ["import triton", "import triton.language as tl", "",
+         "@triton.jit",
+         "def kern(AV, BV, OV, OF, n, GEc: tl.constexpr, LEc: tl.constexpr,"
+         " SUNKc: tl.constexpr, MAXFc: tl.constexpr, MINFc: tl.constexpr,"
+         " BLOCK: tl.constexpr):",
+         "    pid = tl.program_id(0)",
+         "    offs = pid * BLOCK + tl.arange(0, BLOCK)",
+         "    m = offs < n"]
+    for i in range(M):
+        L.append(f"    a{i} = tl.load(AV + offs * {M} + {i}, mask=m, other=0.0).to(tl.float64)")
+        L.append(f"    b{i} = tl.load(BV + offs * {M} + {i}, mask=m, other=0.0).to(tl.float64)")
+    for k in range(M):
+        terms = []
+        for i in range(M):
+            for j in range(M):
+                s = Tc[k, i, j]
+                if s > 0:
+                    terms.append(f"+ a{i} * b{j}")
+                elif s < 0:
+                    terms.append(f"- a{i} * b{j}")
+        expr = " ".join(terms)[2:] if terms and terms[0][0] == "+" else " ".join(terms)
+        L += [f"    r = {expr}" if terms else "    r = tl.zeros((BLOCK,), dtype=tl.float64)",
+              "    nan = r != r",
+              "    r = tl.where(nan, 0.0, r)",
+              "    sg = tl.where(r > 0, 1.0, tl.where(r < 0, -1.0, 0.0))",
+              "    ab = tl.abs(r)",
+              "    over = ab > MAXFc",
+              "    under = (ab > 0) & (ab < MINFc)",
+              "    r = tl.where(over, sg * MAXFc, tl.where(under, sg * MINFc, r))",
+              "    fl = tl.where(nan, GEc + LEc + SUNKc, 0)"
+              " | tl.where(over, GEc, 0) | tl.where(under, LEc, 0)",
+              f"    tl.store(OV + offs * {M} + {k}, r.to(tl.float32), mask=m)",
+              f"    tl.store(OF + offs * {M} + {k}, fl.to(tl.uint8), mask=m)"]
+    # triton の @jit は inspect で ソースを 要求する — 生成コードを 実ファイルに 書いて import
+    import tempfile, importlib.util
+    d = tempfile.mkdtemp(prefix="tot_wcomp_")
+    name = f"wcomp_{M}_{abs(hash(key)) & 0xffffffff:x}"
+    path = os.path.join(d, name + ".py")
+    with open(path, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _WCOMP[key] = mod.kern
+    return mod.kern
+
+def compiled_group_mul(T, a: Tot, b: Tot) -> Tot:
+    """コンパイル済み配線での 積。入力フラグが 全0 なら 直線コードカーネル (group_mul の
+       クリーン経路と 値 f32 一致・旗 ビット一致 — self_test 恒久検査)、フラグが あれば
+       意味論の 正 (group_mul) へ 落とす。大バッチの クリーン積が 獲物 (einsum の M³ 密計算を
+       三値の 疎な 直線和に 置換)。"""
+    if int(a.flag.max()) != 0 or int(b.flag.max()) != 0:
+        return group_mul(T, a, b)
+    kern = compile_wiring(T)
+    B, M = a.val.shape
+    ov = torch.empty((B, M), dtype=torch.float32, device=a.val.device)
+    of = torch.empty((B, M), dtype=torch.uint8, device=a.val.device)
+    BLOCK = 256
+    kern[((B + BLOCK - 1) // BLOCK,)](
+        a.val, b.val, ov, of, B, GEc=int(GE), LEc=int(LE), SUNKc=int(SUNK),
+        MAXFc=float(MAXF), MINFc=float(MINF), BLOCK=BLOCK)
+    return Tot(ov, of)
+
+
 # ============================================================ 要素演算 ekernel の 融合
 @triton.jit
 def _ekernel_kernel(X, C, OV, OF, n, ORDER: tl.constexpr, SHIFT: tl.constexpr,
@@ -344,6 +422,31 @@ def self_test():
     print(f"  1e7成分 exp: 未融合 {t_un*1e3:.1f}ms → 融合 {t_fu*1e3:.2f}ms ({t_un/t_fu:.0f}×)"
           f" / 全域化なし {t_fr*1e3:.2f}ms → レジスタ内の 誠実さ税 {t_fu/t_fr:.2f}×"
           f" / torch.exp(libm) {t_lm*1e3:.2f}ms → 差 {t_fu/t_lm:.1f}×")
+    # 配線コンパイラtoo 影: クリーン経路で group_mul と 値 f32・旗 ビット一致か (溢れ/潰れ込み)
+    for kind, M in (("cd", 4), ("cd", 16), ("cyclic", 8)):
+        T = wiring_tensor(kind, M, dev)
+        B = 100000
+        v = torch.randn(B, M, device=dev, dtype=torch.float64)
+        v[torch.rand(B, M, device=dev) < 0.03] *= 1e25                # f64積で f32天井を 超える 種
+        v[torch.rand(B, M, device=dev) < 0.03] *= 1e-25               # 潰れの 種
+        w = torch.randn(B, M, device=dev, dtype=torch.float64)
+        w[torch.rand(B, M, device=dev) < 0.03] *= 1e25
+        a2, b2 = Tot(v), Tot(w)
+        a2, b2 = Tot(a2.val, torch.zeros_like(a2.flag)), Tot(b2.val, torch.zeros_like(b2.flag))
+        ref2, got2 = group_mul(T, a2, b2), compiled_group_mul(T, a2, b2)
+        nv = int((ref2.val != got2.val).sum()); nf = int((ref2.flag != got2.flag).sum())
+        print(f"  compile_wiring {kind}{M}: 値の不一致 {nv}/{B*M}  旗の不一致 {nf}/{B*M}"
+              f"  {'✓ 完全一致' if nv == 0 and nf == 0 else '← 要調査'}")
+        assert nv == 0 and nf == 0
+    import time as _t2
+    Bq = 1_000_000
+    T4 = wiring_tensor("cd", 4, dev)
+    qa = Tot(torch.randn(Bq, 4, device=dev, dtype=torch.float64))
+    qb = Tot(torch.randn(Bq, 4, device=dev, dtype=torch.float64))
+    tc_ = _g(lambda: compiled_group_mul(T4, qa, qb))
+    tg_ = _g(lambda: group_mul(T4, qa, qb))
+    print(f"  四元数積 1e6: einsum経路 {tg_*1e3:.2f}ms → コンパイル配線 {tc_*1e3:.2f}ms"
+          f" ({tg_/tc_:.1f}×) — 三値契約の 配当 (M³ 密 → 疎 直線和)")
 
 
 def benchmark():
