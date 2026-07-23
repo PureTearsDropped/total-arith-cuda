@@ -417,6 +417,47 @@ def nsolve(A, a, b, side="left", tol=1e-8):
     f = f if r1 < tol else (f | SING if r2 < tol else f | SING | INEXACT)
     return _tot(yv, f), r1
 
+def ekernel(name, arr, order=None):
+    """emap の スカラー胞 (cell = ℝ = 1×1 行列 — 「数=1×1行列」の 公理の 現場) を カーネル化:
+       同じ テープ・同じ 蓄積順序 (P←P·x, acc←acc+c_k·P, 各ステップ _tot) を 配列全体に
+       一括適用する。python ループの emap(cd_alg(1), name, ·) と **ビット一致** (self_test が
+       恒久検査) のまま、成分数ぶんの 解釈器の 税金だけが 消える。candidate (log/sqrt/inv/cbrt)
+       は 定義恒等式を 成分ごとに 検算し、1成分でも 破れれば INEXACT (emap と 同じ OR 規約)。
+       ここが GPU の 入口: 同じ 蓄積順序を torch に 移せば そのまま CUDA カーネル。
+       **任意関数too カーネル化できる**: name に 配列関数 f(np.ndarray)→np.ndarray を 渡すと
+       全成分に 一括適用する (例: np.sign = スカラー版 nnormalize, a/(1+|a|) = squash)。
+       中身は 黒箱なので 数学の 検算は できないが、入口と 出口を 全域化して NaN/∞ を
+       名指しする — 任意コードの 出口税関。ループ emap と ビット一致は self_test の 門番。"""
+    if callable(name):
+        x = _tot(np.asarray(arr, float), 0)
+        with np.errstate(all="ignore"):
+            yv = name(x.c)
+        return _tot(np.asarray(yv, float), x.flag)
+    op = OPS[name]
+    x = _tot(np.asarray(arr, float), 0)
+    X = x.c - 1.0 if op["shift"] else x.c
+    tape, ordr = op["tape"], (order or op["order"])
+    acc = np.full_like(X, float(tape(0)))
+    P = np.ones_like(X)
+    fl = x.flag
+    for k in range(1, ordr + 1):
+        t = _tot(P * X, fl); P, fl = t.c, t.flag
+        ck = float(tape(k))
+        if ck != 0.0:
+            t = _tot(acc + P * ck, fl); acc, fl = t.c, t.flag
+    y = Nel(acc, fl)
+    if op["kind"] == "forward":
+        return y
+    if name == "log":
+        resid = np.abs(ekernel("exp", y.c).c - x.c)
+    elif name == "sqrt":
+        resid = np.abs(y.c * y.c - x.c)
+    elif name == "cbrt":
+        resid = np.abs(y.c * y.c * y.c - x.c)
+    else:                                                     # inv: 両側 (スカラーでは 同値)
+        resid = np.abs(y.c * x.c - 1.0)
+    return y if float(resid.max()) < 1e-6 else Nel(y.c, y.flag | INEXACT)
+
 def nnormalize(A, x):
     """a/‖a‖ — 実スカラー除算のみ (方向は そのまま・0→0 は 公理 a/0=0)。どの Alg でも 同じ
        1本: 胞に 使えば 成分の 正規化、容器 (mat_over 等) に 使えば 行列全体の 大域正規化。"""
@@ -951,6 +992,33 @@ def self_test():
     print("emap×任意関数: 成分ごと nnormalize (全成分‖·‖=1・0成分は0のまま) ✓ ; 自作活性化 "
           "squash=v/(1+‖v‖) ✓ ; 同じ nnormalize を 容器に=大域正規化 ✓ — 棚の 演算名でも "
           "呼び出し可能でも 塊ごとに 通る")
+    # --- ekernel: スカラー胞 (1×1) の カーネル化 — ループ emap と ビット一致・税金だけ 消える ---
+    R1 = cd_alg(1)
+    sc = rng.standard_normal(2048) * 0.4 + 1.0
+    sc[7] = 9.0                                               # 1成分 域外 → 値too 旗too 一致を 見る
+    for opn in ("exp", "sqrt", "log"):
+        yk, yl = ekernel(opn, sc), emap(R1, opn, Nel(sc.copy(), 0))
+        assert np.array_equal(yk.c, yl.c) and yk.flag == yl.flag, opn
+    import time as _time
+    t0 = _time.perf_counter(); ekernel("exp", sc); tk = _time.perf_counter() - t0
+    t0 = _time.perf_counter(); emap(R1, "exp", Nel(sc.copy(), 0)); tl = _time.perf_counter() - t0
+    print(f"ekernel: スカラー胞 (1×1=数) の カーネル化 — ループ emap と 値・旗 ビット一致 ✓ "
+          f"(exp/sqrt/log, 2048成分+1汚染) ; 速度 {tl / tk:.0f}× (ループ {tl * 1e3:.0f}ms → "
+          f"一括 {tk * 1e3:.1f}ms) — 同じ 蓄積順序を torch に 移せば そのまま CUDA")
+    # --- ekernel × 任意関数: nnormalize/squash の 配列版が ループ emap と ビット一致 ---
+    yk = ekernel(np.sign, sc)                                 # スカラー版 nnormalize = sign (0→0)
+    yl = emap(R1, nnormalize, Nel(sc.copy(), 0))
+    assert np.array_equal(yk.c, yl.c) and yk.flag == yl.flag
+    sqk = ekernel(lambda a: a * (1.0 / (1.0 + np.abs(a))), sc)  # squash の 配列版 (乗算順序too 同一に)
+    sql = emap(R1, squash, Nel(sc.copy(), 0))
+    assert np.array_equal(sqk.c, sql.c)
+    bad_f = ekernel(lambda a: 1.0 / a, np.array([2.0, 0.0, 4.0]))   # 黒箱が IEEE の 1/0=∞ を 吐く
+    assert (bad_f.flag & OVER) and float(np.abs(bad_f.c).max()) <= MAXF   # → 出口税関が ±MAX+OVER で 名指し
+    t0 = _time.perf_counter(); ekernel(lambda a: a * (1.0 / (1.0 + np.abs(a))), sc); tk2 = _time.perf_counter() - t0
+    t0 = _time.perf_counter(); emap(R1, squash, Nel(sc.copy(), 0)); tl2 = _time.perf_counter() - t0
+    print(f"ekernel×任意関数: sign=スカラーnnormalize・squash 配列版が ループと ビット一致 ✓ ; "
+          f"黒箱の 1/0=∞ too 出口税関が ±MAX+OVER で 名指し ✓ ; 速度 {tl2 / tk2:.0f}× — "
+          f"任意関数の 要素適用too カーネルで 走って 嘘は 出ない")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)
