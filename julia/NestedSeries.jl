@@ -493,6 +493,73 @@ function emap(cell::Alg, name, x::Nel; order::Union{Int,Nothing} = nothing,
     Nel(out, flag)
 end
 
+"""ekernel — 高レベル演算の スカラー胞 (1×1 = 数) を 配列一括で (python ekernel の 双子)。
+   同じ 蓄積順序 (P←P·x, acc←acc+c_k·P)・入口 全域化・candidate は 定義恒等式を 検算。
+   tot=:auto (既定): 演算前の 範囲検査 |X|max^order·(1+Σ|c_k|) < MAX/2 が 通れば 級数中の
+   事故は 起き得ない = ステップごと 全域化は 恒等写像 → 省略 (値・旗 ビット一致のまま
+   税だけ 消える)。通らなければ 毎段検査へ 自動フォールバック。name に 関数 f(Vector)→Vector
+   を 渡すと 任意関数の 一括適用 (入口/出口の 税関つき)。"""
+function ekernel(name, arr::Vector{Float64}; order = nothing, tot = :auto)
+    if !(name isa Symbol)
+        x = _tot(copy(arr), 0x00)
+        return _tot(Float64.(name(x.c)), x.flag)
+    end
+    op = OPS[name]
+    x = _tot(copy(arr), 0x00)
+    X = op.shift ? x.c .- 1.0 : x.c
+    ordr = order === nothing ? op.order : order
+    cks = [Float64(op.tape(k)) for k in 0:ordr]
+    step_tot = tot === true ? true : tot === false ? false :
+        !(maximum(abs, X; init = 0.0) <
+          (0.5 * floatmax(Float64) / (1.0 + sum(abs, cks)))^(1.0 / ordr))
+    acc = fill(cks[1], length(X))
+    P = ones(length(X))
+    fl = x.flag
+    for k in 1:ordr
+        if step_tot
+            t = _tot(P .* X, fl); P = t.c; fl = t.flag
+        else
+            P = P .* X
+        end
+        ck = cks[k + 1]
+        if ck != 0.0
+            if step_tot
+                t = _tot(acc .+ P .* ck, fl); acc = t.c; fl = t.flag
+            else
+                acc = acc .+ P .* ck
+            end
+        end
+    end
+    y = Nel(acc, fl)
+    op.kind === :forward && return y
+    resid = name === :log ? maximum(abs.(coeffs(ekernel(:exp, y.c)) .- x.c)) :
+            name === :sqrt ? maximum(abs.(y.c .* y.c .- x.c)) :
+            name === :cbrt ? maximum(abs.(y.c .* y.c .* y.c .- x.c)) :
+            maximum(abs.(y.c .* x.c .- 1.0))
+    resid < 1e-6 ? y : Nel(y.c, y.flag | INEXACT)
+end
+
+"""三値配線の コンパイル (cuda_fused.compile_wiring の Julia 流): 表引きの 密 M³ ループを
+   非零だけの 疎索引 直線ループに 落とす — Julia の JIT が これを 機械語化するので
+   「配線→専用コード」に 相当。出力 ≡ rawmul (self_test が 検査)。"""
+function compile_wiring(A::Alg)
+    ks = Int[]; is_ = Int[]; js = Int[]; ss = Float64[]
+    for i in 1:A.dim, j in 1:A.dim, k in 1:A.dim
+        s = A.tab[i][j][k]
+        if s != 0.0
+            push!(ks, k); push!(is_, i); push!(js, j); push!(ss, s)
+        end
+    end
+    M = A.dim
+    return (x, y) -> begin
+        r = zeros(M)
+        @inbounds for t in eachindex(ks)
+            r[ks[t]] += ss[t] * x[is_[t]] * y[js[t]]
+        end
+        r
+    end
+end
+
 "print the preset shelf: name, kind, and what the candidate verification checks"
 function list_ops()
     for (nm, op) in sort(collect(OPS); by = first)
@@ -1171,6 +1238,27 @@ function self_test()
     @assert abs(LinearAlgebra.norm(coeffs(nnormalize(Mh4, nel(Mh4, xz2)))) - 1.0) < 1e-12
     println("emap×任意関数: 成分ごと nnormalize (‖·‖=1・0成分は0のまま) ✓ ; 自作活性化 squash ✓ ; ",
             "同じ nnormalize を 容器に=大域正規化 ✓")
+    # --- ekernel (python 双子): ループ emap / auto(事前証明) / 毎段検査 の ビット一致 ---
+    scj = 0.4 .* rand_vec(gg, 4096) .+ 1.0
+    scj[8] = 9.0                                             # 1成分 域外 (検算破れ)
+    for opn in (:exp, :sqrt, :log)
+        yk = ekernel(opn, scj)
+        yt = ekernel(opn, scj; tot = true)
+        yl = emap(cd_alg(1), opn, Nel(copy(scj), 0x00))
+        @assert yk.c == yt.c && yk.c == yl.c && yk.flag == yt.flag == yl.flag
+        bigj = copy(scj); bigj[4] = 1e200                     # 証明が 通らない → フォールバック
+        @assert ekernel(opn, bigj).c == ekernel(opn, bigj; tot = true).c
+    end
+    yfn = ekernel(v -> sign.(v), scj)                        # 任意関数too (スカラー nnormalize)
+    @assert yfn.c == sign.(scj)
+    println("ekernel: auto(事前証明)/毎段検査/ループ emap — 値・旗 ビット一致 ✓ ; 任意関数 ✓")
+    # --- compile_wiring: 疎索引の 直線ループ ≡ rawmul ---
+    for Ac in (cd_alg(4), cd_alg(16), grassmann_alg(2))
+        cw = compile_wiring(Ac)
+        xr, yr = rand_vec(gg, Ac.dim), rand_vec(gg, Ac.dim)
+        @assert maximum(abs.(cw(xr, yr) .- rawmul(Ac, xr, yr))) < 1e-14
+    end
+    println("compile_wiring: cd4/cd16/Λ2 で ≡ rawmul ✓ (疎索引 直線ループ)")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 

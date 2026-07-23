@@ -417,7 +417,7 @@ def nsolve(A, a, b, side="left", tol=1e-8):
     f = f if r1 < tol else (f | SING if r2 < tol else f | SING | INEXACT)
     return _tot(yv, f), r1
 
-def ekernel(name, arr, order=None):
+def ekernel(name, arr, order=None, tot="auto"):
     """emap の スカラー胞 (cell = ℝ = 1×1 行列 — 「数=1×1行列」の 公理の 現場) を カーネル化:
        同じ テープ・同じ 蓄積順序 (P←P·x, acc←acc+c_k·P, 各ステップ _tot) を 配列全体に
        一括適用する。python ループの emap(cd_alg(1), name, ·) と **ビット一致** (self_test が
@@ -427,7 +427,10 @@ def ekernel(name, arr, order=None):
        **任意関数too カーネル化できる**: name に 配列関数 f(np.ndarray)→np.ndarray を 渡すと
        全成分に 一括適用する (例: np.sign = スカラー版 nnormalize, a/(1+|a|) = squash)。
        中身は 黒箱なので 数学の 検算は できないが、入口と 出口を 全域化して NaN/∞ を
-       名指しする — 任意コードの 出口税関。ループ emap と ビット一致は self_test の 門番。"""
+       名指しする — 任意コードの 出口税関。ループ emap と ビット一致は self_test の 門番。
+       tot="auto" (既定): 演算前の 範囲検査 |X|max^order·(1+Σ|c_k|) < MAX/2 が 通れば
+       級数中の 事故は 起き得ない = ステップごと 全域化は 恒等写像 → 省略 (値・旗 ビット
+       一致の まま 税だけ 消える)。通らなければ 毎段検査へ 自動フォールバック。"""
     if callable(name):
         x = _tot(np.asarray(arr, float), 0)
         with np.errstate(all="ignore"):
@@ -437,14 +440,27 @@ def ekernel(name, arr, order=None):
     x = _tot(np.asarray(arr, float), 0)
     X = x.c - 1.0 if op["shift"] else x.c
     tape, ordr = op["tape"], (order or op["order"])
+    if tot == "auto":
+        s = 1.0 + sum(abs(float(tape(k))) for k in range(ordr + 1))
+        amax = float(np.abs(X).max()) if X.size else 0.0
+        step_tot = not (amax < (0.5 * MAXF / s) ** (1.0 / ordr))
+    else:
+        step_tot = bool(tot)
     acc = np.full_like(X, float(tape(0)))
     P = np.ones_like(X)
     fl = x.flag
-    for k in range(1, ordr + 1):
-        t = _tot(P * X, fl); P, fl = t.c, t.flag
-        ck = float(tape(k))
-        if ck != 0.0:
-            t = _tot(acc + P * ck, fl); acc, fl = t.c, t.flag
+    with np.errstate(all="ignore"):
+        for k in range(1, ordr + 1):
+            if step_tot:
+                t = _tot(P * X, fl); P, fl = t.c, t.flag
+            else:
+                P = P * X
+            ck = float(tape(k))
+            if ck != 0.0:
+                if step_tot:
+                    t = _tot(acc + P * ck, fl); acc, fl = t.c, t.flag
+                else:
+                    acc = acc + P * ck
     y = Nel(acc, fl)
     if op["kind"] == "forward":
         return y
@@ -999,6 +1015,11 @@ def self_test():
     for opn in ("exp", "sqrt", "log"):
         yk, yl = ekernel(opn, sc), emap(R1, opn, Nel(sc.copy(), 0))
         assert np.array_equal(yk.c, yl.c) and yk.flag == yl.flag, opn
+        yt = ekernel(opn, sc, tot=True)                       # auto(事前証明) ≡ 毎段検査
+        assert np.array_equal(yk.c, yt.c) and yk.flag == yt.flag, opn
+        big_in = sc.copy(); big_in[3] = 1e200                 # 証明が 通らない 入力 → フォールバック
+        ya, yb = ekernel(opn, big_in), ekernel(opn, big_in, tot=True)
+        assert np.array_equal(ya.c, yb.c) and ya.flag == yb.flag, opn
     import time as _time
     t0 = _time.perf_counter(); ekernel("exp", sc); tk = _time.perf_counter() - t0
     t0 = _time.perf_counter(); emap(R1, "exp", Nel(sc.copy(), 0)); tl = _time.perf_counter() - t0
