@@ -294,11 +294,23 @@ def _ekernel_kernel(X, C, OV, OF, n, ORDER: tl.constexpr, SHIFT: tl.constexpr,
 
 _EK_COEFS = {}
 
-def fused_ekernel(name, x, order=None, tot=True):
+def _safe_bound(C, ordr):
+    """安全域の 半径: |x|max^order · (1+Σ|c_k|) < MAX/2 なら 級数の 途中で 溢れ/NaN は
+       起き得ない (べきも 部分和too この積で 抑えられる)。この 証明が 通る 入力では
+       ステップごと 全域化は 恒等写像 — 検査を 外しても 値・旗 とも ビット一致が 保証される。"""
+    s = 1.0 + float(C.abs().sum().item())
+    return (0.5 * 1.7976931348623157e308 / s) ** (1.0 / ordr)
+
+def fused_ekernel(name, x, order=None, tot="auto"):
     """cuda_total.ekernel_gpu の 融合版: 級数 全段 + 全域化が レジスタ内で 完結し、HBM は
        入出力の 1 往復だけ (未融合は 級数 1 段 ≈ カーネル 数個 × order)。契約: 値・成分ごと旗
        とも ekernel_gpu と ビット一致 (self_test が 恒久検査) — つまり numpy ekernel とも 一致。
-       tot=False は 全域化なしの 対照 (誠実さ税の 測定用)。candidate の 検算は 出口で 数パス。
+       tot="auto" (既定): **演算前の 1 回の 範囲検査** (_safe_bound) で「級数中に 事故は
+       起き得ない」を 証明できたら 内部検査なしカーネルで 走る — 境界=証拠級・内部=証明済み
+       (傾斜誠実性の 法則を カーネルに 移植)。証明が 通らない 入力 (NaN/∞/巨大値 混入) は
+       ステップごと検査カーネルへ 自動フォールバック。どちらの 経路too 値・旗 ビット一致。
+       tot=True は 常に ステップごと検査、tot=False は 全域化なしの 対照 (税の 測定用)。
+       candidate の 検算は 出口で 数パス。
        **自作テープtoo 融合で 走る**: name に (キー文字列, テープ関数, 次数, shift) の 組を
        渡すと 任意の 級数 (合成式の テイラー係数 等) が 同じ 1 パス評価器に 載る — O 層の
        開放が 融合カーネルまで 通る (torch は 関数ごとに 専用カーネルだが、こちらは 評価器
@@ -322,11 +334,16 @@ def fused_ekernel(name, x, order=None, tot=True):
     n = xT.numel()
     ov = torch.empty_like(xT)
     of = torch.empty(n, dtype=torch.uint8, device=xT.device)
+    if tot == "auto":
+        amax = float((xT - 1.0).abs().max().item() if shift else xT.abs().max().item())
+        step_tot = not (amax < _safe_bound(_EK_COEFS[key], ordr))   # NaN は 比較 False → 検査へ
+    else:
+        step_tot = bool(tot)
     BLOCK = 1024
     _ekernel_kernel[((n + BLOCK - 1) // BLOCK,)](
         xT, _EK_COEFS[key], ov, of, n, ORDER=ordr, SHIFT=shift,
-        TOT=bool(tot), BLOCK=BLOCK)
-    if kind == "forward" or not tot:
+        TOT=step_tot, BLOCK=BLOCK)
+    if kind == "forward" or tot is False:
         return ov, of
     vt, _ = _tot64(xT, torch.zeros(n, dtype=torch.uint8, device=xT.device))
     if name == "log":
@@ -415,13 +432,25 @@ def self_test():
         fn(); torch.cuda.synchronize()
         t0 = _t.perf_counter(); fn(); torch.cuda.synchronize()
         return _t.perf_counter() - t0
+    # auto (演算前の 範囲検査で 内部検査を 証明つきで 省略) too 影: 清潔/毒 両方で ビット一致
+    scc = torch.as_tensor(rngk.standard_normal(1_000_000) * 0.4 + 1.0,
+                          dtype=torch.float64, device=dev)
+    for opn in ("exp", "sqrt", "log"):
+        va, fa_ = fused_ekernel(opn, scc, tot="auto")
+        vt_, ft_ = fused_ekernel(opn, scc, tot=True)
+        assert torch.equal(va, vt_) and torch.equal(fa_, ft_), opn   # 安全域: 無検査でも 一致
+        va2, fa2_ = fused_ekernel(opn, sck, tot="auto")              # 毒入り: 自動フォールバック
+        vt2_, ft2_ = fused_ekernel(opn, sck, tot=True)
+        assert torch.equal(va2, vt2_) and torch.equal(fa2_, ft2_), opn
+    print("  fused_ekernel auto: 安全域=証明つき無検査 / 毒入り=自動フォールバック — 全経路 ビット一致 ✓")
     t_un = _g(lambda: ekernel_gpu("exp", big))
-    t_fu = _g(lambda: fused_ekernel("exp", big))
+    t_fu = _g(lambda: fused_ekernel("exp", big, tot=True))
+    t_au = _g(lambda: fused_ekernel("exp", big))                     # auto (既定)
     t_fr = _g(lambda: fused_ekernel("exp", big, tot=False))
     t_lm = _g(lambda: torch.exp(big))
-    print(f"  1e7成分 exp: 未融合 {t_un*1e3:.1f}ms → 融合 {t_fu*1e3:.2f}ms ({t_un/t_fu:.0f}×)"
-          f" / 全域化なし {t_fr*1e3:.2f}ms → レジスタ内の 誠実さ税 {t_fu/t_fr:.2f}×"
-          f" / torch.exp(libm) {t_lm*1e3:.2f}ms → 差 {t_fu/t_lm:.1f}×")
+    print(f"  1e7成分 exp: 未融合 {t_un*1e3:.1f}ms → 融合(毎段検査) {t_fu*1e3:.2f}ms → "
+          f"auto(事前証明) {t_au*1e3:.2f}ms / 検査なし対照 {t_fr*1e3:.2f}ms → 税 "
+          f"{t_fu/t_fr:.2f}×→{t_au/t_fr:.2f}× / torch.exp {t_lm*1e3:.2f}ms → 差 {t_au/t_lm:.1f}×")
     # 配線コンパイラtoo 影: クリーン経路で group_mul と 値 f32・旗 ビット一致か (溢れ/潰れ込み)
     for kind, M in (("cd", 4), ("cd", 16), ("cyclic", 8)):
         T = wiring_tensor(kind, M, dev)
