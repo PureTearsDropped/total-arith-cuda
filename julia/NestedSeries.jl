@@ -300,7 +300,9 @@ function series(A::Alg, x::Nel, tape; order::Int = 20, bracket::Symbol = :left)
     acc = tscale(nel(A), Float64(c(0)))
     P = nel(A)
     for k in 1:order
-        P = bracket === :left ? tmul(A, P, x) : tmul(A, x, P)
+        P = bracket === :left ? tmul(A, P, x) :
+            bracket === :right ? tmul(A, x, P) :
+            tscale(tadd(tmul(A, P, x), tmul(A, x, P)), 0.5)      # :sym = Jordan 括弧
         ck = Float64(c(k))
         ck != 0.0 && (acc = tadd(acc, tscale(P, ck)))
     end
@@ -377,11 +379,35 @@ const OPS = Dict{Symbol,NamedTuple}(
     :cbrt  => (kind = :candidate, tape = binom_tape(1 / 3), shift = true, order = 40,
                verify = (A, x, y) -> maximum(abs.(coeffs(tmul(A, tmul(A, y, y), y)) .- x.c))),
 )
+const _MATF = Dict{Symbol,Function}(:exp => exp, :log => log, :sqrt => sqrt, :inv => inv)
+
+"""左/右作用モード: f(L_x)·e₀ / f(R_x)·e₀ — 演算を 作用素行列の 行列関数(stdlib)として 作る。
+   級数半径の 外まで 届く(PSD 行列 sqrt が 無スケーリングで 通る)代わりに 候補扱い:
+   虚部・非有限・定義恒等式の 検算に 合格した ものだけ 通す(だめなら INEXACT)。"""
+function _action_op(A::Alg, name::Symbol, x::Nel, mode::Symbol)
+    haskey(_MATF, name) || error("作用モード対応は exp/log/sqrt/inv のみ: $name")
+    Mx = mode === :laction ? Lmat_alg(A, x.c) : Rmat_alg(A, x.c)
+    yc = try
+        _MATF[name](Matrix{ComplexF64}(Mx)) * ComplexF64.(A.unit)
+    catch
+        fill(complex(NaN), A.dim)
+    end
+    fin = all(isfinite, yc)
+    im_ok = fin && maximum(abs.(imag.(yc))) < 1e-8
+    y = _tot(Float64.(real.(yc)), x.flag)
+    op = OPS[name]
+    resid = op.kind === :forward ? 0.0 : op.verify(A, x, y)
+    (fin && im_ok && resid < 1e-6) ? y : Nel(y.c, y.flag | INEXACT)
+end
+
 """run a preset by name on any Alg: `nop(A, :sqrt, x)`.  Forward presets are total for
    every input; candidates verify their defining identity and flag INEXACT on failure —
-   same honesty for every operator, uniformly."""
+   same honesty for every operator, uniformly.
+   bracket = 五モード {:left, :right, :sym, :laction, :raction}: 前3つは 胞の級数、
+   後2つは 作用素行列の 行列関数 (_action_op)。べき結合的なら 一致 (測って主張)。"""
 function nop(A::Alg, name::Symbol, x::Nel; order::Union{Int,Nothing} = nothing,
              bracket::Symbol = :left)
+    bracket in (:laction, :raction) && return _action_op(A, name, x, bracket)
     op = OPS[name]
     ord = order === nothing ? op.order : order
     arg = op.shift ? tadd(x, tscale(nel(A), -1.0)) : x
@@ -468,6 +494,11 @@ nsolve_left(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
 "solve y·a = x: R_a⁺x (非可換なので 左と 一般に 別解)"
 nsolve_right(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
     _solve_via(Rmat_alg, y -> tmul(A, y, a), A, a, x, K, tol)
+
+"solve (a·y + y·a)/2 = x — 対称(Jordan)方程式: S_a⁺x, S_a = (L_a+R_a)/2 (三面目の 解く除算)"
+nsolve_sym(A::Alg, a::Nel, x::Nel; K::Int = 30, tol::Float64 = 1e-8) =
+    _solve_via((B, c) -> 0.5 .* (Lmat_alg(B, c) .+ Rmat_alg(B, c)),
+               y -> tscale(tadd(tmul(A, a, y), tmul(A, y, a)), 0.5), A, a, x, K, tol)
 
 """nsolve_batch — バッチ solve の「Julia 流の融合」: 割り当てゼロ・バッファ使い回し・
    構造テンソルの 密配列化で L 構築も 反復も 検算も 1 パス (cuda_fused_solve.py の CPU 双子)。
@@ -608,6 +639,19 @@ function commut_defect(A::Alg; trials::Int = 4, rng = nothing)
         worst = max(worst, maximum(abs.(tmul(A, x, y).c .- tmul(A, y, x).c)))
     end
     worst
+end
+
+"""表2枚 = 代数登録の玄関 (python table_alg の 双子): 経路 mul[i][j] (0始まり) と 符号
+   sig[i][j]∈{−1,0,+1}・三値門番つき (配線正規形 — TBM_SPEC §1.5)。作った Alg には
+   nop(五モード)・nsolve_left/right/sym・組合せ器・naive_impl が 全部 自動で 効く。"""
+function table_alg(name::String, mul, sig)
+    M = length(mul)
+    all(s in (-1, 0, 1) for row in sig for s in row) || error("三値正規形 破れ")
+    tab = [[zeros(M) for _ in 1:M] for _ in 1:M]
+    for i in 1:M, j in 1:M
+        tab[i][j][mul[i][j] + 1] = Float64(sig[i][j])
+    end
+    Alg(name, M, Float64.(1:M .== 1), tab)
 end
 
 # ================================================================ UVW algorithms (IMPLS の双子・最小)
@@ -971,6 +1015,25 @@ function self_test()
     @assert implR(pim) == 3 && impl_verify(pim, A2) < 1e-12
     println("UVW双子: gauss R=3 ≡ cd2 ✓ ; naive⟨Λ2⟩ R=9(16でなく=死に積なし) ✓ ; ",
             "人工死に積 R 4→3・ΣUVW≡T のまま ✓ (併合はしない)")
+    # --- 表 → 代数 → 演算族の 自動導出 (五モード) + 対称 solve ---
+    sq = table_alg("splitquat", [[0, 1, 2, 3], [1, 0, 3, 2], [2, 3, 0, 1], [3, 2, 1, 0]],
+                   [[1, 1, 1, 1], [1, -1, 1, -1], [1, -1, 1, -1], [1, 1, 1, 1]])
+    xq = nel(sq, [0.3, -0.2, 0.25, 0.1])
+    esq = [coeffs(nop(sq, :exp, xq; bracket = m))
+           for m in (:left, :right, :sym, :laction, :raction)]
+    sprd = maximum(maximum(abs.(e .- esq[1])) for e in esq)
+    @assert sprd < 1e-9                                    # 結合的 → 五モード一致 (測って主張)
+    Am2 = matn_alg(2)
+    psd = nel(Am2, [4.0, 1.0, 1.0, 3.0])
+    yps = nop(Am2, :sqrt, psd; bracket = :laction)
+    @assert (flagof(yps) & INEXACT) == 0
+    @assert maximum(abs.(rawmul(Am2, coeffs(yps), coeffs(yps)) .- coeffs(psd))) < 1e-9
+    @assert (flagof(nop(Am2, :sqrt, psd)) & INEXACT) != 0  # 級数(左結合)は 域外 → 正直に INEXACT
+    aq, bq = nel(sq, [1.0, 0.5, -0.3, 0.2]), nel(sq, [0.7, -0.1, 0.4, 0.6])
+    ysm, r1s, _ = nsolve_sym(sq, aq, bq)
+    @assert r1s < 1e-8 && (flagof(ysm) & SING) == 0
+    println("表→自動演算: splitquat 五モード exp 一致 ", round(sprd, sigdigits = 2),
+            " ✓ ; PSD行列sqrt 作用モードで域外救済 ✓ (級数はINEXACT✓) ; nsolve_sym 厳密 ✓")
     println("done: cells × combinators × tapes compose freely; laws measured per combination")
 end
 

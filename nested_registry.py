@@ -60,6 +60,27 @@ def rawmul(A, x, y):
     with np.errstate(over="ignore", invalid="ignore"):
         return np.einsum("i,j,ijk->k", x, y, A.T)
 
+def table_alg(name, mul, sig):
+    """表2枚 = 代数登録の玄関: 経路 mul[i][j] (基底積が落ちる先) と 符号 sig[i][j]∈{−1,0,+1}。
+       三値門番つき (配線正規形 — total-arith-cuda/TBM_SPEC §1.5)。ここで作った Alg には
+       演算族 (nop 五モード・nsolve)・組合せ器 (mat_over/tensor/jordan)・IMPLS (naive_impl)
+       が 全部 自動で 効く — 演算は 表 T だけから 導出されるので 追加の 実装は 不要。"""
+    M = len(mul)
+    assert all(s in (-1, 0, 1) for row in sig for s in row), "三値正規形 破れ"
+    T = np.zeros((M, M, M))
+    for i in range(M):
+        for j in range(M):
+            T[i, j, mul[i][j]] = float(sig[i][j])
+    return Alg(name, np.eye(M)[0], T)
+
+def Lmat(A, xc):
+    "左作用素 L_x (L_x·y = x·y) — 正則表現。演算の 自動導出は この行列の 関数で 済む"
+    return np.einsum("i,ijk->kj", np.asarray(xc, float), A.T)
+
+def Rmat(A, xc):
+    "右作用素 R_x (R_x·y = y·x)"
+    return np.einsum("j,ijk->ki", np.asarray(xc, float), A.T)
+
 # ================================================================ N layer: cell registry
 def _cdconj(x): return np.concatenate([x[:1], -x[1:]]) if len(x) > 1 else x.copy()
 def _cdprod(x, y):
@@ -223,12 +244,15 @@ TAPES = {
 }
 
 def series(A, x, tape, order=20, bracket="left"):
-    "Σ c_k x^k with powers built by the DECLARED bracket — one skeleton, many tapes"
+    """Σ c_k x^k with powers built by the DECLARED bracket — one skeleton, many tapes.
+       bracket: left ((x·x)·x…) / right (x·(x·x)…) / sym (Jordan 括弧 (P·x+x·P)/2)。
+       べき結合的なら 三者一致 (測って主張)・非結合なら 割れを 宣言。"""
     c = TAPES[tape] if isinstance(tape, str) else tape
     acc = tscale(nel(A), float(c(0)))
     P = nel(A)
     for k in range(1, order + 1):
-        P = tmul(A, P, x) if bracket == "left" else tmul(A, x, P)
+        P = (tmul(A, P, x) if bracket == "left" else tmul(A, x, P) if bracket == "right"
+             else tscale(tadd(tmul(A, P, x), tmul(A, x, P)), 0.5))
         ck = float(c(k))
         if ck != 0.0: acc = tadd(acc, tscale(P, ck))
     return acc
@@ -282,14 +306,53 @@ OPS = {
                      rawmul(A, rawmul(A, y.c, y.c), y.c) - x.c)))),   # (y·y)·y declared
 }
 
+_SCALF = {"exp": np.exp, "sin": np.sin, "cos": np.cos, "sinh": np.sinh, "cosh": np.cosh,
+          "atan": np.arctan, "log": np.log, "inv": lambda w: 1.0 / w, "sqrt": np.sqrt,
+          "cbrt": lambda w: w ** (1.0 / 3.0)}
+
+def _action_op(A, name, x, mode):
+    """左/右作用モード: f(L_x)·e₀ / f(R_x)·e₀ — 演算を 作用素行列の 行列関数として 作る。
+       級数半径の 外まで 届く (PSD 行列 sqrt が 無スケーリングで 通る) 代わりに、固有分解は
+       候補にすぎない: 再構成・虚部・非有限・定義恒等式の 検算に 合格した ものだけ 通す。"""
+    Mx = Lmat(A, x.c) if mode == "laction" else Rmat(A, x.c)
+    with np.errstate(all="ignore"):
+        w, Vv = np.linalg.eig(Mx)
+        rec = float(np.abs((Vv * w) @ np.linalg.inv(Vv) - Mx).max())      # 対角化の 検算
+        yv = ((Vv * _SCALF[name](w.astype(complex))) @ np.linalg.inv(Vv)) @ A.unit.astype(complex)
+    fin = bool(np.isfinite(yv).all())
+    imag = float(np.abs(yv.imag).max()) if fin else np.inf
+    y = _tot(yv.real, x.flag)
+    op = OPS[name]
+    resid = 0.0 if op["kind"] == "forward" else op["verify"](A, x, y)
+    ok = fin and imag < 1e-8 and rec < 1e-8 * (1.0 + float(np.abs(Mx).max())) and resid < 1e-6
+    return y if ok else Nel(y.c, y.flag | INEXACT)
+
 def nop(A, name, x, order=None, bracket="left"):
-    "run any preset on any Alg — forward: total; candidate: verified or INEXACT"
+    """run any preset on any Alg — forward: total; candidate: verified or INEXACT。
+       bracket = 五モード {left, right, sym, laction, raction}: 前3つは 胞の級数 (series)、
+       後2つは 作用素行列の 行列関数 (_action_op)。結合的なら 五者一致 (測って主張)。"""
+    if bracket in ("laction", "raction"):
+        return _action_op(A, name, x, bracket)
     op = OPS[name]
     arg = tadd(x, tscale(nel(A), -1.0)) if op["shift"] else x
     y = series(A, arg, op["tape"], order or op["order"], bracket)
     if op["kind"] == "forward": return y
     resid = op["verify"](A, x, y)
     return y if resid < 1e-6 else Nel(y.c, y.flag | INEXACT)
+
+def nsolve(A, a, b, side="left", tol=1e-8):
+    """解く除算 — 公理 a/0=0 (=1×1 の Moore–Penrose) の 全ランク版 (julia の nsolve_left/right
+       の numpy 双子 + 対称): a·y=b (left) / y·a=b (right) / (a·y+y·a)/2=b (sym) を 作用素行列の
+       lstsq (=擬似逆) で 解く。二層検証: 前進残差→厳密 (クリーン) / 正規方程式のみ→最小二乗解に
+       SING / どちらも×→SING|INEXACT。戻り値 (y, 前進残差)。"""
+    Mo = {"left": Lmat(A, a.c), "right": Rmat(A, a.c),
+          "sym": 0.5 * (Lmat(A, a.c) + Rmat(A, a.c))}[side]
+    yv = np.linalg.lstsq(Mo, b.c, rcond=None)[0]
+    r1 = float(np.abs(Mo @ yv - b.c).max())
+    r2 = float(np.abs(Mo.T @ (Mo @ yv - b.c)).max())
+    f = a.flag | b.flag
+    f = f if r1 < tol else (f | SING if r2 < tol else f | SING | INEXACT)
+    return _tot(yv, f), r1
 
 def list_ops():
     for nm in sorted(OPS):
@@ -662,6 +725,50 @@ def self_test():
     imp = prune_impl(dead)
     assert imp.R == 3 and impl_verify(imp, cd_alg(2)) < 1e-12
     print(f"死に積: 棚 {len(IMPLS)} 種 prune no-op ✓ ; 人工死に積 R 4→3・ΣUVW≡T のまま ✓ (併合はしない)")
+    # --- 表 → 代数 → 演算族の 自動導出 (五モード) + 解く除算 nsolve ---
+    print("--- derived ops: 表2枚から exp/log/sqrt/solve 一式が 自動 (五モード) ---")
+    sq = table_alg("splitquat", [[0, 1, 2, 3], [1, 0, 3, 2], [2, 3, 0, 1], [3, 2, 1, 0]],
+                   [[1, 1, 1, 1], [1, -1, 1, -1], [1, -1, 1, -1], [1, 1, 1, 1]])
+    xq = nel(sq, [0.3, -0.2, 0.25, 0.1])
+    yv = rng.standard_normal(4)                                   # L/R 行列の 向きの 検算
+    assert np.abs(Lmat(sq, xq.c) @ yv - rawmul(sq, xq.c, yv)).max() < 1e-12
+    assert np.abs(Rmat(sq, xq.c) @ yv - rawmul(sq, yv, xq.c)).max() < 1e-12
+    _M5 = ("left", "right", "sym", "laction", "raction")
+    es = [nop(sq, "exp", xq, bracket=m).c for m in _M5]
+    spread = max(float(np.abs(e - es[0]).max()) for e in es)
+    assert spread < 1e-9                                          # 結合的 → 五モード一致
+    assert not (nop(sq, "sqrt", tadd(nel(sq), tscale(xq, 0.5)), bracket="laction").flag & INEXACT)
+    Msq = mat_over(sq, 2)                                         # 自作代数の 行列 — 何も 書かずに 動く
+    xm = nel(Msq, 0.15 * rng.standard_normal(Msq.dim))
+    assert all(np.isfinite(nop(Msq, "exp", xm, bracket=m).c).all() for m in ("left", "sym"))
+    A2m = matn_alg(2)                                             # 作用モードの 実力: 級数域外の 救済
+    psd = nel(A2m, [4.0, 1.0, 1.0, 3.0])
+    yps = nop(A2m, "sqrt", psd, bracket="laction")
+    assert not (yps.flag & INEXACT)
+    assert np.abs(rawmul(A2m, yps.c, yps.c) - psd.c).max() < 1e-9
+    assert nop(A2m, "sqrt", psd).flag & INEXACT                   # 級数(左結合)は 域外 → 正直
+    aq, bq = nel(sq, [1.0, 0.5, -0.3, 0.2]), nel(sq, [0.7, -0.1, 0.4, 0.6])
+    for sd in ("left", "right", "sym"):                           # 解く除算: 正則 → 三面とも 厳密
+        ysv, r1 = nsolve(sq, aq, bq, sd)
+        assert r1 < 1e-9 and not (ysv.flag & SING), sd
+    zd = nel(cd_alg(16), np.eye(16)[3] + np.eye(16)[10])          # セデニオン 零因子
+    yz, _ = nsolve(cd_alg(16), zd, nel(cd_alg(16), rng.standard_normal(16)), "left")
+    assert yz.flag & SING                                         # range 外 → 最小二乗と 名指し
+    x16 = nel(cd_alg(16), 0.4 * rng.standard_normal(16))
+    e16 = [nop(cd_alg(16), "exp", x16, bracket=m).c for m in _M5]
+    sp16 = max(float(np.abs(e - e16[0]).max()) for e in e16)
+    assert sp16 < 1e-9              # 非結合でも べき結合的 (sed16) → 五モード一致 (exp∘log 門番と 同じ法則)
+    MC = mat_over(cd_alg(16), 2)    # べき結合性 喪失の 証人 → モードが 割れるのを 測って 宣言
+    xmc = nel(MC, 0.35 * rng.standard_normal(MC.dim))
+    dspl = float(np.abs(nop(MC, "exp", xmc).c - nop(MC, "exp", xmc, bracket="sym").c).max())
+    assert dspl > 1e-3
+    dEQ = float(np.abs(nop(MC, "exp", xmc, bracket="right").c
+                       - nop(MC, "exp", xmc, bracket="laction").c).max())
+    assert dEQ < 1e-9               # 構造的恒等式: L_x^k·e₀ = 右結合べき ⟹ laction ≡ right (常に)
+    print(f"表→自動演算: splitquat 五モード exp 一致 {spread:.0e} ✓ ; mat⟨splitquat⟩ too ✓ ; "
+          f"PSD行列sqrt 作用モードで域外救済 ✓ (級数はINEXACT✓) ; nsolve 左/右/対称 厳密・"
+          f"零因子はSING ✓ ; べき結合的なら 五モード一致 (sed16 {sp16:.0e}) / 喪失なら 割れを 宣言 "
+          f"(mat2⟨cd16⟩ {dspl:.2f}) ; 恒等式 laction≡right {dEQ:.0e} ✓")
     # MAPS: 4枚目の棚 — DFT準同型・畳み込み定理・周波数代数
     print("--- MAPS shelf (代数間の写像・準同型性は測って主張) ---")
     fq = diag_alg(8)
