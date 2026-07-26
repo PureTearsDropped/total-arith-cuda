@@ -1,5 +1,7 @@
 # total-arith-cuda — the Total Bilinear Machine (TBM)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21489922.svg)](https://doi.org/10.5281/zenodo.21489922)
+
 **A small computer for honest arithmetic.** Its core is one *totalized bilinear* multiply
 `c = Wᵀ((U·a)⊙(V·b))` over numbers that are `(value, quality-flag)` pairs — it **never
 emits `NaN`/`Inf`**, every algebra (complex … sedenion, matrices, convolution, *your own*)
