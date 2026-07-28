@@ -121,7 +121,15 @@ def tot_add(a, b):
     # 相殺可能 × フラグあり → 境界なし+SUNK。境界(GE/LE)だけでなく **SUNK 単独でも 落とす**:
     # (2,SUNK)+(3,SUNK) の 真値は ±2±3 ⟹ |真| ∈ {1,5} で 大きさ厳密が 壊れる
     # （第3ラウンド監査の 指摘を 受けた 自前オラクル強化で 発見・2026-07-19）。
-    f = torch.where((fin > 0) & cancel, torch.full_like(fin, GE | LE | SUNK), fin)
+    # 真の零は **加法単位元** (tot_mul の 吸収則と 対): 真値が 厳密に 0 なら 和は 相手
+    # そのもので 相殺は 起こらない — 相手の 境界主張は 無傷で 生き残る（2026-07-28,
+    # TBM TRIT の 「0 枝 = 真の零」を AXPY 合流で 漏洩ゼロに するための 発見）。
+    # ただし 相手が **危険な0** (表示0+GE = 真値も 符号も 自由) なら 適用不可 — 旧則の
+    # SUNK が 必要（自前オラクルが 即座に 検出した 反例: (0,LE)+(0,GE) → 表示0 無SUNK は 嘘）。
+    ident = ((_true_zero(a.val, a.flag) | _true_zero(b.val, b.flag))
+             & ~(_danger_zero(a.val, a.flag) | _danger_zero(b.val, b.flag)))
+    f = torch.where((fin > 0) & cancel & ~ident,
+                    torch.full_like(fin, GE | LE | SUNK), fin)
     return Tot(val, sflag | f)
 
 def tot_div(a, b):

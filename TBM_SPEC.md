@@ -75,25 +75,41 @@ c = Wᵀ((U·a) ⊙ (V·b))        (⊙ は成分ごとの積・R = 実乗算の
 | 4 | **AXPY** | 足し算 | `AXPY[h] dst, src, c` (dst←dst+c·src) | `cuda_total.tot_add` |
 | 5 | **NORM** | 桁揃え | `NORM dst, src` | `gate_bfp.blocknorm` (total-arith-hardware) |
 | 6 | **CHECK** | 検算 | `CHECK law=<LAWS名>, args...` → INEXACT / 行マスク (§2.5) | probe 関数群 (assoc_defect 等・LAWS棚 §6) |
-| 7 | **SELECT** | 分岐の配線化 | `SELECT dst, mask, a, b[, orflag_false]` | `tbm.run` (torch.where) — HW では MUX |
+| 7 | **TRIT** | 三値門 (if の配線化) | `TRIT dst, t, src[, comp][, orflag]` | `tbm.run` — HW では 桁ごと符号反転+ゼロ化 |
 
-### 2.5 SELECT — if をビット演算へコンパイルする (2026-07-28)
+### 2.5 TRIT — if をビット演算へコンパイルする (2026-07-28)
+
+trit t ∈ {−1, 0, +1} 単位の積。**三値契約 (§1.5) の配線アルファベットが実行時の
+命令に降りてきた形**であり、SD 桁 × 語 の積の原子:
+
+- **+1** = 素通し (val も flag も — |係数|=1 のフラグ素通り則)
+- **−1** = 符号反転して通す (SD 桁の積・flag は素通り)
+- **0** = **真の零** (val 0・flag 0) にして捨てる — 算術の零ではなく**選択の零**
+
+二値の if は trit の部分集合 (t≠0 = then / t=0 = else — `comp=True` が else 枝)。
+mask は比較結果から作る: CHECK の成分ごとモード `CHECK law=residual, src, tol` が
+「行の全成分 |r| ≤ tol **かつ** 残差経路のフラグ清潔」で行マスクを生成する
+(残差計算自身が飽和した行は検算不能=不合格 — 嘘なし)。
+
+**昇格の根拠** (退化定理の外にあることの証明): 正直な算術の 0×(|x|≥MAX) は
+「0×∞ かもしれない」ので SUNK を免れない (tot_mul の危険な0則)。BILIN/AXPY は
+フラグを **OR で合流**させるため、既存6命令の任意の組合せは非選択枝の札を
+必ず運んでしまう。TRIT の 0 は「このオペランドのビットを捨てる」という**選択の
+意味論**であり、算術には存在しない。乗算 0 本の純配線・HW では MUX+XOR。
+
+**SELECT は命令ではなくマクロ** (退化定理の拡張・機械はさらに小さい):
 
 ```
-select(mask, a, b) = (mask ∧ a) ∨ (¬mask ∧ b)     mask ∈ {全ビット1, 全ビット0}
+select(mask, a, b) = TRIT(mask, a) + TRIT(mask, b, comp) + AXPY 合流
 ```
 
-を **val と flag の双方に同じマスクで**適用する。mask は比較結果から作る
-(`mask = 0 − condition`: 1→111…111, 0→000…000)。CHECK の成分ごとモード
-`CHECK law=residual, src, tol` が「行の全成分 |r| ≤ tol **かつ** 残差経路のフラグ清潔」で
-この行マスクを生成する (残差計算自身が飽和した行は検算不能=不合格 — 嘘なし)。
-
-**昇格の根拠** (退化定理の外にあることの証明): 算術混合 `p·x + (1−p)·y` は
-0×NaN=NaN であり、全域算術でも BILIN/AXPY はフラグを **OR で合流**させるため、
-既存6命令の任意の組合せは非選択枝の札を必ず運んでしまう。
-「**選ばれなかった値を計算結果へ漏らさない**」は新しい意味論であり、命令に値する。
-乗算 0 本 (係数は {0,1} のみ) の純配線で、三値契約 (§1.5) の下限に位する。
-`orflag_false` は不合格側に貼る名札 (INEXACT 等) — 例外を投げない全域性の道具。
+kill された枝は真の零なので AXPY の OR 合流でも何も漏れない — 漏洩ゼロが
+trit の零の意味論から従う。これを支えるのが `tot_add` の**加法単位元則**
+(2026-07-28 追加・tot_mul の吸収則と対): 真の零 + x = x で相殺は起こらず、
+x の境界主張は無傷で生き残る。ただし相手が**危険な0** (表示0+GE) なら適用不可 —
+自前オラクル (60万件×二証人) が反例 `(0,LE)+(0,GE)` を即座に検出し、旧則の
+SUNK が必要と教えた。`orflag` は不合格側に貼る名札 (INEXACT 等) — 例外を
+投げない全域性の道具。
 
 **退化定理** (機械が小さいことの証明): LINMAP と AXPY は BILIN の退化形である —
 片腕を定数 e₀ に固定した `BILIN(x, e₀; U=M, V=1, W=I)` は任意の線形写像になる。
@@ -150,7 +166,7 @@ select(mask, a, b) = (mask ∧ a) ∨ (¬mask ∧ b)     mask ∈ {全ビット1
 | AXPY | ✅ tot_add | ✅ | ✅ | ✅ `sd_add2` |
 | NORM | ✅ gate golden 委譲 | — | — | ✅ `blocknorm` |
 | CHECK | ✅ LAWS 4種 + residual行マスク | ✅ residual行マスク | ✅ LAWS 3種 (rank_exact 空欄) | — |
-| SELECT | ✅ (bit一致) | ✅ (bit一致) | — | — |
+| TRIT | ✅ (bit一致) | ✅ (bit一致) | — | — |
 | width ダイヤル | ✅ f64/f32 | ✅ | ✅ f64/f32 | (厳密整数 — 丸め自体なし) |
 
 適合水準: **L0** = bare で値一致 / **L1** = + coarse フラグ一致 / **L2** = + evidence bit一致。
@@ -168,7 +184,8 @@ select(mask, a, b) = (mask ∧ a) ∨ (¬mask ∧ b)     mask ∈ {全ビット1
 | マクロ | 展開 (骨格) | 融合実行係 |
 |--------|------------|-----------|
 | **EXP / SIN / COS** | `TOTALIZE → (scale) → { BILIN; AXPY(c_k) }×order → { BILIN(自乗) }×sq` テープ差し替え=関数差し替え | `cuda_fused_pipeline` series (GPU) / `gate_series` (HW仕様=Fraction一致) |
-| **LOG / SQRT / INV** | 無審査 oracle 候補 → BILIN(定義恒等式の左辺) → **CHECK**(residual→行マスク) → **SELECT** (合格=候補素通し / 不合格=INEXACT 名札・値は通す) — `tbm.macro_sqrt/inv/log` (アセンブラ級・self_test ⑦⑧⑨⑩)。LOG の検算は EXP マクロ (門番の入れ子)。INV の x=0 行は MP 候補 0 に INEXACT が正しく立つ | hyper_transcend (nlog/nsqrt/ninv) |
+| **SELECT** | `TRIT(mask,a) + TRIT(mask,b,comp) + AXPY` — 命令でなくマクロ (§2.5)。漏洩ゼロは trit の零 + 加法単位元則から従う | `tbm.macro_select` (self_test ⑥b) |
+| **LOG / SQRT / INV** | 無審査 oracle 候補 → BILIN(定義恒等式の左辺) → **CHECK**(residual→行マスク) → **SELECT マクロ** (合格=候補素通し / 不合格=INEXACT 名札・値は通す) — `tbm.macro_sqrt/inv/log` (アセンブラ級・self_test ⑦⑧⑨⑩)。LOG の検算は EXP マクロ (門番の入れ子)。INV の x=0 行は MP 候補 0 に INEXACT が正しく立つ | hyper_transcend (nlog/nsqrt/ninv) |
 | **SOLVE** | Ben-Israel 反復 `X ← X(2I−LX)` = { BILIN; AXPY }ループ → **CHECK** (残差) → 零因子は SING | `cuda_fused_solve` (67.4M/s) / `gate_solve` (HW) |
 | **CONV** (高速畳み込み) | `LINMAP(F の因子列) → BILIN(対角) → LINMAP(F⁻¹ の因子列)` — FFT は「LINMAP を log n 回」というプログラム | 融合WH畳み込み 7.4G/s・n≤16 融合DFT が cuFFT 経路の 9× |
 | **DISCOVER** (法則発見) | ライブラリ行列を BILIN/LINMAP で構築 → evidence フラグで汚染行を名指し除外 → 零空間 SVD → **CHECK** (ギャップ・恒真式) | implicit_discovery / Discovery.jl |

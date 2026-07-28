@@ -6,7 +6,7 @@
   (cuda_total / cuda_fused / nested_registry / total-arith-hardware の golden) を
   呼ぶだけ。本モジュールが 持ち込む 新規の 意味論は **coarse (粗誠実)** ただ1つ (SPEC §3)。
 
-  命令 7 種 (SPEC §2): TOTALIZE / BILIN / LINMAP / AXPY / NORM / CHECK / SELECT。
+  命令 7 種 (SPEC §2): TOTALIZE / BILIN / LINMAP / AXPY / NORM / CHECK / TRIT。
   バックエンド: cpu (torch cpu) / gpu (torch cuda + 融合カーネル) / hw (run_everywhere.py が
   cocotb+iverilog で 駆動 — サブセット ISA)。適合表は SPEC §4。
 """
@@ -121,13 +121,15 @@ class Program:
         self.ins.append(("CHECK", dict(dst=dst, law=law, args=args)))
         return self
 
-    def SELECT(self, dst, mask, a, b, orflag_false=0):
-        """第7命令 (SPEC §2.5): ビット選択 (mask∧a)∨(¬mask∧b) を val と flag の 双方に。
-           算術混合 p·x+(1−p)·y と 違い 非選択枝は 値も 札も 一切 漏れない。
-           BILIN/AXPY は 札を OR で 合流させるため 既存命令では 表現不能 (昇格の 根拠)。
-           乗算 0 本・HW では ただの MUX。orflag_false: 不合格側に 貼る 名札 (INEXACT 等)。"""
-        self.ins.append(("SELECT", dict(dst=dst, mask=mask, a=a, b=b,
-                                        orflag_false=int(orflag_false))))
+    def TRIT(self, dst, t, src, comp=False, orflag=0):
+        """第7命令 (SPEC §2.5): 三値門 — trit t ∈ {−1,0,+1} 単位の 積。
+           +1 = 素通し / −1 = 符号反転して 通す (SD 桁の 積) / 0 = **真の零**にして 捨てる
+           (val 0・flag 0 — 算術の 零でなく 選択の 零。0×GE は 算術では SUNK を 免れないが、
+           選択は ビットを 捨てる 宣言なので 何も 運ばない)。flag は |t|=1 で 素通り (§1.5)。
+           comp=True: else 枝 (t=0 の 行だけ 通す)。orflag: 生存側に 貼る 名札 (INEXACT 等)。
+           HW では 桁ごと 符号反転+ゼロ化・乗算 0 本。二値の if は trit の 部分集合。"""
+        self.ins.append(("TRIT", dict(dst=dst, t=t, src=src, comp=bool(comp),
+                                      orflag=int(orflag))))
         return self
 
     def describe(self):
@@ -222,12 +224,17 @@ def run(prog, feed, where="cpu", env0=None):
                                  & (r.flag.amax(-1) == 0))
             else:
                 env[p["dst"]] = float(LAWS[p["law"]](**p["args"]))
-        elif op == "SELECT":
-            m = env[p["mask"]]
-            mk = m.reshape(-1, 1) if m.dim() == 1 else m
-            a, b = env[p["a"]], env[p["b"]]
-            val = torch.where(mk, a.val, b.val)
-            flag = torch.where(mk, a.flag, b.flag | np.uint8(p["orflag_false"]))
+        elif op == "TRIT":
+            t = env[p["t"]].to(torch.int8)
+            assert bool(torch.all((t >= -1) & (t <= 1))), "trit は {−1,0,+1} のみ"
+            if p["comp"]:
+                t = (t == 0).to(torch.int8)                  # else 枝
+            tk = t.reshape(-1, 1) if t.dim() == 1 else t
+            src = env[p["src"]]
+            keep = tk != 0
+            val = src.val * tk.to(src.val.dtype)
+            flag = torch.where(keep, src.flag | np.uint8(p["orflag"]),
+                               torch.zeros_like(src.flag))  # 0 枝 = 真の零 (札も 捨てる)
             env[p["dst"]] = Tot(val, flag)
     return env
 
@@ -245,11 +252,21 @@ def macro_exp(prog, dst, x, alg="sedenion", order=8, honesty="coarse"):
     return prog
 
 
-def _certify(prog, dst, resid, tol):
-    "候補パターンの 共通尾部: CHECK(residual) → SELECT (合格=候補 素通し / 不合格=INEXACT 名札)。"
-    prog.CHECK("_m", law="residual", src=resid, tol=tol)
-    prog.SELECT(dst, "_m", dst, dst, orflag_false=INEXACT)
+def macro_select(prog, dst, mask, a, b, orflag_false=0):
+    """SELECT = (mask∧a)∨(¬mask∧b) は **マクロ** (退化定理の 拡張): TRIT×2 + AXPY。
+       kill された 枝は 真の零 (val 0・flag 0) なので AXPY の OR 合流でも 何も 漏れない —
+       漏洩ゼロが trit の 零の 意味論から 従う。機械は SELECT 命令を 持つ 必要が ない。
+       (else 枝を 先に 読む — a/b が dst と 同名でも 壊れない 順序)"""
+    prog.TRIT("_else", mask, b, comp=True, orflag=orflag_false)
+    prog.TRIT(dst, mask, a)
+    prog.AXPY(dst, "_else")
     return prog
+
+
+def _certify(prog, dst, resid, tol):
+    "候補パターンの 共通尾部: CHECK(residual) → select (合格=候補 素通し / 不合格=INEXACT 名札)。"
+    prog.CHECK("_m", law="residual", src=resid, tol=tol)
+    return macro_select(prog, dst, "_m", dst, dst, orflag_false=INEXACT)
 
 
 def macro_sqrt(prog, dst, x, cand, alg="quaternion", honesty="evidence", tol=1e-6):
@@ -363,20 +380,26 @@ def self_test():
     assert d < 1e-6, d
     print(f"   マクロ展開 vs nexp: 最大差 {d:.1e} ✓")
 
-    print("⑥ SELECT の 契約: 非選択枝は 値も 札も 漏れない (AXPY の OR 合流とは 別物)")
+    print("⑥ TRIT の 契約: +1=素通し / −1=符号反転 (SD 桁の 積) / 0=真の零 (札ごと 捨てる)")
     dirty = Tot(torch.full((4, 4), 7.0), torch.full((4, 4), GE, dtype=torch.uint8))
+    trit = torch.tensor([1, -1, 0, 0], dtype=torch.int8)
+    Pt = Program("trit").TRIT("g", "t", "d")
+    g = run(Pt, {}, "cpu", env0={"t": trit, "d": dirty})["g"]
+    assert torch.all(g.val[0] == 7.0) and torch.all(g.flag[0] == GE), "+1 素通し 破れ"
+    assert torch.all(g.val[1] == -7.0) and torch.all(g.flag[1] == GE), "−1 反転 破れ"
+    assert torch.all(g.val[2:] == 0.0) and int(g.flag[2:].max()) == 0, "0 が 真の零で ない"
+    leak = tot_add(Tot(torch.ones(4, 4)), dirty)             # 対照: 算術合流は 必ず 漏れる
+    assert int(leak.flag.max()) > 0
+    print("   +1: 値7 札GE ✓ / −1: 値−7 札GE ✓ / 0: val 0 flag 0 ✓ / tot_add 対照は 漏れる ✓")
+
+    print("⑥b select マクロ (TRIT×2+AXPY): 非選択枝は 値も 札も 漏れない")
     clean = Tot(torch.ones(4, 4))
-    mask = torch.tensor([True, True, False, False])
-    Ps = Program("sel"); Ps.ins.append(("SELECT", dict(dst="s", mask="m", a="c", b="d",
-                                                       orflag_false=INEXACT)))
-    out_s = run(Ps, {}, "cpu", env0={"m": mask, "c": clean, "d": dirty})
-    s = out_s["s"]
+    mask = torch.tensor([1, 1, 0, 0], dtype=torch.int8)
+    Ps = Program("sel"); macro_select(Ps, "s", "m", "c", "d", orflag_false=INEXACT)
+    s = run(Ps, {}, "cpu", env0={"m": mask, "c": clean, "d": dirty})["s"]
     assert torch.all(s.val[:2] == 1.0) and int(s.flag[:2].max()) == 0, "選択枝が 汚れた"
     assert torch.all(s.val[2:] == 7.0) and torch.all(s.flag[2:] == (GE | INEXACT))
-    leak = tot_add(clean, dirty)                             # 対照: 算術合流は 必ず 漏れる
-    assert int(leak.flag.max()) > 0
-    print("   mask=True 行: 値1・札0 (GE を 捨てた) ✓ / False 行: GE|INEXACT ✓ / "
-          "tot_add 対照は 札が 漏れる ✓")
+    print("   mask=1 行: 値1・札0 (GE を 捨てた) ✓ / mask=0 行: GE|INEXACT ✓")
 
     print("⑦ SQRT マクロ: 候補は 信じない・検算だけ 信じる (complex)")
     y = rng.standard_normal((6, 2))

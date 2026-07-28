@@ -102,7 +102,15 @@ function tot_add(a::Tot, b::Tot)
     # Cancellation-possible × ANY flag → no-bound + SUNK. Not just bounds: SUNK alone also
     # breaks the exact-magnitude claim — (2,SUNK)+(3,SUNK) has true value ±2±3, |true| ∈
     # {1,5} (found by our strengthened oracle after audit round 3, 2026-07-19).
-    f = ifelse.((fin .> 0) .& cancel, GE | LE | SUNK, fin)
+    # A true zero is the **additive identity** (dual of tot_mul's absorption): the true
+    # value is exactly 0, so the sum is the other operand — no cancellation, its bound
+    # claims survive intact (2026-07-28, needed for leak-free TRIT/AXPY merge in TBM).
+    # NOT applicable when the other side is a **danger zero** (display 0 + GE: true value
+    # and sign free) — the old rule's SUNK is required there (oracle counterexample:
+    # (0,LE)+(0,GE) → display 0 without SUNK is a lie).
+    ident = (_true_zero(a.val, a.flag) .| _true_zero(b.val, b.flag)) .&
+            .!(_danger_zero(a.val, a.flag) .| _danger_zero(b.val, b.flag))
+    f = ifelse.((fin .> 0) .& cancel .& .!ident, GE | LE | SUNK, fin)
     return Tot(val, sflag .| f)
 end
 
