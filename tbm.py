@@ -6,7 +6,7 @@
   (cuda_total / cuda_fused / nested_registry / total-arith-hardware の golden) を
   呼ぶだけ。本モジュールが 持ち込む 新規の 意味論は **coarse (粗誠実)** ただ1つ (SPEC §3)。
 
-  命令 6 種 (SPEC §2): TOTALIZE / BILIN / LINMAP / AXPY / NORM / CHECK。
+  命令 7 種 (SPEC §2): TOTALIZE / BILIN / LINMAP / AXPY / NORM / CHECK / SELECT。
   バックエンド: cpu (torch cpu) / gpu (torch cuda + 融合カーネル) / hw (run_everywhere.py が
   cocotb+iverilog で 駆動 — サブセット ISA)。適合表は SPEC §4。
 """
@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from cuda_total import Tot, GE, LE, SUNK, group_mul, tot_add, wiring_tensor, _sat
 import nested_registry as NR
+
+INEXACT = 8   # 定義恒等式が 検算に 通らなかった (cuda_total nsolve の 0x08 と 同値・GE|LE|SUNK=7 と 直交)
 
 HW_REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "..", "total-arith-hardware"))
@@ -115,7 +117,17 @@ class Program:
         return self
 
     def CHECK(self, dst, law, **args):
+        "law='residual' は 成分ごと モード: 残差バッファ → 行マスク (SELECT の 述語)。"
         self.ins.append(("CHECK", dict(dst=dst, law=law, args=args)))
+        return self
+
+    def SELECT(self, dst, mask, a, b, orflag_false=0):
+        """第7命令 (SPEC §2.5): ビット選択 (mask∧a)∨(¬mask∧b) を val と flag の 双方に。
+           算術混合 p·x+(1−p)·y と 違い 非選択枝は 値も 札も 一切 漏れない。
+           BILIN/AXPY は 札を OR で 合流させるため 既存命令では 表現不能 (昇格の 根拠)。
+           乗算 0 本・HW では ただの MUX。orflag_false: 不合格側に 貼る 名札 (INEXACT 等)。"""
+        self.ins.append(("SELECT", dict(dst=dst, mask=mask, a=a, b=b,
+                                        orflag_false=int(orflag_false))))
         return self
 
     def describe(self):
@@ -146,11 +158,12 @@ def _norm_golden(vals, Ein, W=6, Win=24, Emax=20, EW=12):
                 Eout=bus_val([int(b) for b in Eg]) % (1 << EW))
 
 
-def run(prog, feed, where="cpu"):
+def run(prog, feed, where="cpu", env0=None):
     """cpu / gpu バックエンドで 実行。feed: {名前: 配列}。返り値: {名前: Tot | dict | float}。
-       gpu が 未対応の 命令 (NORM) は 適合表の 空欄 通り '—' を 返す (偽装しない)。"""
+       gpu が 未対応の 命令 (NORM) は 適合表の 空欄 通り '—' を 返す (偽装しない)。
+       env0: 構築済み バッファ (Tot / mask) の 持ち込み (テスト・部分実行 用)。"""
     dev = torch.device(where if where != "gpu" else "cuda")
-    env = {}
+    env = dict(env0) if env0 else {}
     for op, p in prog.ins:
         if op == "TOTALIZE":
             x = torch.as_tensor(np.asarray(feed[p["src"]], dtype=np.float64), device=dev)
@@ -200,7 +213,22 @@ def run(prog, feed, where="cpu"):
             env[p["dst"]] = [_norm_golden([int(t) for t in row[:p["block"]]], p["Ein"])
                              for row in v.cpu().numpy()]
         elif op == "CHECK":
-            env[p["dst"]] = float(LAWS[p["law"]](**p["args"]))
+            if p["law"] == "residual":
+                # 成分ごと モード: 行の 全成分 |r| ≤ tol かつ 残差経路が 清潔 ⟺ 合格。
+                # 残差計算 自身が 飽和した 行は 「検算 不能」であり 合格に できない (嘘なし)。
+                r = env[p["args"]["src"]]
+                tol = float(p["args"].get("tol", 1e-6))
+                env[p["dst"]] = ((r.val.double().abs().amax(-1) <= tol)
+                                 & (r.flag.amax(-1) == 0))
+            else:
+                env[p["dst"]] = float(LAWS[p["law"]](**p["args"]))
+        elif op == "SELECT":
+            m = env[p["mask"]]
+            mk = m.reshape(-1, 1) if m.dim() == 1 else m
+            a, b = env[p["a"]], env[p["b"]]
+            val = torch.where(mk, a.val, b.val)
+            flag = torch.where(mk, a.flag, b.flag | np.uint8(p["orflag_false"]))
+            env[p["dst"]] = Tot(val, flag)
     return env
 
 
@@ -215,6 +243,46 @@ def macro_exp(prog, dst, x, alg="sedenion", order=8, honesty="coarse"):
         prog.BILIN("_term", "_term", x, alg=alg, honesty=honesty)
         prog.AXPY(dst, "_term", c=1.0 / math.factorial(k))
     return prog
+
+
+def _certify(prog, dst, resid, tol):
+    "候補パターンの 共通尾部: CHECK(residual) → SELECT (合格=候補 素通し / 不合格=INEXACT 名札)。"
+    prog.CHECK("_m", law="residual", src=resid, tol=tol)
+    prog.SELECT(dst, "_m", dst, dst, orflag_false=INEXACT)
+    return prog
+
+
+def macro_sqrt(prog, dst, x, cand, alg="quaternion", honesty="evidence", tol=1e-6):
+    """SQRT マクロ (SPEC §5): 候補は 信じない・検算だけ 信じる。
+       cand は feed 供給の **無審査 oracle** (どこから 来ても よい)。機械が するのは
+       BILIN で 自乗 → x を 引いた 残差 → CHECK → SELECT のみ。
+       合格行: cand の 値と 札が そのまま 通る (検算経路の 札は SELECT が 捨てる)。
+       不合格行: 値は 通す (全域性 — 例外を 投げない) が INEXACT を 行名指しで 立てる。"""
+    prog.TOTALIZE(dst, cand)
+    prog.BILIN("_r", dst, dst, alg=alg, honesty=honesty)
+    prog.AXPY("_r", x, c=-1.0)
+    return _certify(prog, dst, "_r", tol)
+
+
+def macro_inv(prog, dst, x, cand, unit, alg="quaternion", honesty="evidence", tol=1e-6):
+    """INV マクロ: 検算は cand·x − e₀。x=0 行は oracle が 0 を 返せば (Moore-Penrose:
+       a/0=0 は 定理) 恒等式 0·0=e₀ が 成り立たないので INEXACT が 正しく 立つ —
+       値 0 のまま 通り、名札が 「逆元では ない」ことを 言う。"""
+    prog.TOTALIZE(dst, cand)
+    prog.BILIN("_r", dst, x, alg=alg, honesty=honesty)
+    prog.AXPY("_r", unit, c=-1.0)
+    return _certify(prog, dst, "_r", tol)
+
+
+def macro_log(prog, dst, x, cand, alg="quaternion", honesty="coarse",
+              order=12, tol=1e-4):
+    """LOG マクロ: 検算は exp(cand) − x — **log の 門番は exp** (LAWS powerassoc と
+       同じ 思想が プログラムに なった 形)。exp は macro_exp の 級数 展開なので
+       定義域は 級数の 収束域 (‖cand‖ 小)。feed に f'{dst}__unit' (=e₀) が 要る。"""
+    prog.TOTALIZE(dst, cand)
+    macro_exp(prog, "_ey", dst, alg=alg, order=order, honesty=honesty)
+    prog.AXPY("_ey", x, c=-1.0)
+    return _certify(prog, dst, "_ey", tol)
 
 
 # ================================================================ self-test
@@ -294,6 +362,66 @@ def self_test():
     d = np.abs(oute["acc"].val.numpy() - refe).max()
     assert d < 1e-6, d
     print(f"   マクロ展開 vs nexp: 最大差 {d:.1e} ✓")
+
+    print("⑥ SELECT の 契約: 非選択枝は 値も 札も 漏れない (AXPY の OR 合流とは 別物)")
+    dirty = Tot(torch.full((4, 4), 7.0), torch.full((4, 4), GE, dtype=torch.uint8))
+    clean = Tot(torch.ones(4, 4))
+    mask = torch.tensor([True, True, False, False])
+    Ps = Program("sel"); Ps.ins.append(("SELECT", dict(dst="s", mask="m", a="c", b="d",
+                                                       orflag_false=INEXACT)))
+    out_s = run(Ps, {}, "cpu", env0={"m": mask, "c": clean, "d": dirty})
+    s = out_s["s"]
+    assert torch.all(s.val[:2] == 1.0) and int(s.flag[:2].max()) == 0, "選択枝が 汚れた"
+    assert torch.all(s.val[2:] == 7.0) and torch.all(s.flag[2:] == (GE | INEXACT))
+    leak = tot_add(clean, dirty)                             # 対照: 算術合流は 必ず 漏れる
+    assert int(leak.flag.max()) > 0
+    print("   mask=True 行: 値1・札0 (GE を 捨てた) ✓ / False 行: GE|INEXACT ✓ / "
+          "tot_add 対照は 札が 漏れる ✓")
+
+    print("⑦ SQRT マクロ: 候補は 信じない・検算だけ 信じる (complex)")
+    y = rng.standard_normal((6, 2))
+    A2 = NR.alg("complex")
+    x2 = np.stack([NR.rawmul(A2, y[i], y[i]) for i in range(6)])
+    y_bad = y.copy(); y_bad[2] += 0.5                        # 行2 の 候補を 汚す
+    Pq = Program("sqrt"); Pq.TOTALIZE("x", "in_x")
+    macro_sqrt(Pq, "s", "x", "in_cand", alg="complex")
+    outq = run(Pq, {"in_x": x2, "in_cand": y_bad}, "cpu")
+    fl = outq["s"].flag.amax(-1)
+    assert int(fl[2]) == INEXACT and int(fl[torch.arange(6) != 2].max()) == 0
+    assert np.allclose(outq["s"].val.numpy(), y_bad.astype(np.float32))
+    print("   汚した 行2 だけ INEXACT・他 5 行 清潔 ✓ / 値は 全行 通貨 (全域性) ✓")
+
+    print("⑧ INV マクロ: x=0 行は Moore-Penrose 候補 0 → INEXACT が 正しく 立つ (quaternion)")
+    x4i = rng.standard_normal((5, 4)); x4i[3] = 0.0
+    n2 = (x4i**2).sum(-1, keepdims=True); n2[3] = 1.0
+    cand = x4i * np.array([1.0, -1, -1, -1]) / n2            # conj/|x|² (行3 は 0)
+    Pi = Program("inv"); Pi.TOTALIZE("x", "in_x"); Pi.TOTALIZE("one", "in_e0")
+    macro_inv(Pi, "v", "x", "in_cand", "one", alg="quaternion")
+    outi = run(Pi, {"in_x": x4i, "in_cand": cand,
+                    "in_e0": np.tile([1.0, 0, 0, 0], (5, 1))}, "cpu")
+    fli = outi["v"].flag.amax(-1)
+    assert int(fli[3]) == INEXACT and int(fli[torch.arange(5) != 3].max()) == 0
+    assert np.all(outi["v"].val.numpy()[3] == 0.0)
+    print("   正則 4 行 合格・零因子行 のみ INEXACT (値 0 のまま 通貨) ✓")
+
+    print("⑨ LOG マクロ: 検算は exp — log の 門番が プログラムに なった (quaternion)")
+    u = 0.3 * rng.standard_normal((4, 4))
+    xl = np.stack([NR.nexp(A4, NR.nel(A4, u[i]), order=16).c for i in range(4)])
+    u_bad = u.copy(); u_bad[1] += 0.3
+    Pl = Program("log"); Pl.TOTALIZE("x", "in_x")
+    macro_log(Pl, "L", "x", "in_cand", alg="quaternion")
+    outl = run(Pl, {"in_x": xl, "in_cand": u_bad,
+                    "L__unit": np.tile([1.0, 0, 0, 0], (4, 1))}, "cpu")
+    fll = outl["L"].flag.amax(-1)
+    assert int(fll[1]) == INEXACT and int(fll[torch.arange(4) != 1].max()) == 0
+    print("   真の log 3 行 合格・汚した 行1 のみ INEXACT ✓")
+
+    if dev_ok:
+        print("⑩ SQRT マクロを gpu で — cpu と 値・フラグ bit一致")
+        outg2 = run(Pq, {"in_x": x2, "in_cand": y_bad}, "gpu")
+        assert np.array_equal(outg2["s"].val.cpu().numpy(), outq["s"].val.numpy())
+        assert np.array_equal(outg2["s"].flag.cpu().numpy(), outq["s"].flag.numpy())
+        print("   cpu ≡ gpu ✓")
     print("done — 薄い層は 薄いまま (意味論は 全部 呼び先)")
 
 
