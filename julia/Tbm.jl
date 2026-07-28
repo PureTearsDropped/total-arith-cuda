@@ -82,6 +82,10 @@ AXPY!(P, dst, src; c = 1.0) =
     (push!(P.ins, (:AXPY, Dict(:dst => dst, :src => src, :c => Float64(c)))); P)
 CHECK!(P, dst, law; args...) =
     (push!(P.ins, (:CHECK, Dict(:dst => dst, :law => law, :args => args))); P)
+"第7命令 三値門 (SPEC §2.5): +1=素通し / −1=符号反転 / 0=真の零にして捨てる (val/flag 双方)。"
+TRIT!(P, dst, t, src; comp = false, orflag = 0) =
+    (push!(P.ins, (:TRIT, Dict(:dst => dst, :t => t, :src => src,
+                               :comp => comp, :orflag => UInt8(orflag)))); P)
 
 const _ALG_M = Dict(:sedenion => 16, :octonion => 8, :quaternion => 4, :complex => 2)
 _wiring(alg::Symbol) = HA.wiring_tensor(:cd, _ALG_M[alg])
@@ -112,6 +116,18 @@ function run_program(P::Program, feed::Dict)
                 x = HA.Tot(sc.val, sc.flag .| x.flag)          # 札は 保守的に 通す
             end
             env[p[:dst]] = HA.tot_add(env[p[:dst]], x)
+        elseif op === :TRIT
+            traw = env[p[:t]]
+            tv = traw isa HA.Tot ? traw.val : traw
+            ti = Int8.(tv)
+            @assert all(-1 .<= ti .<= 1) "trit は {−1,0,+1} のみ"
+            if p[:comp]; ti = Int8.(ti .== 0); end
+            tk = ndims(ti) == 1 ? reshape(ti, :, 1) : ti
+            src = env[p[:src]]
+            keep = tk .!= 0
+            val = Float32.(src.val .* tk)
+            flag = ifelse.(keep, src.flag .| p[:orflag], 0x00)   # 0 枝 = 真の零 (札も 捨てる)
+            env[p[:dst]] = HA.Tot(val, flag)
         elseif op === :CHECK
             env[p[:dst]] = Float64(LAWS[p[:law]](values(p[:args])...))
         end

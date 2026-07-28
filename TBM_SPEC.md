@@ -95,7 +95,12 @@ mask は比較結果から作る: CHECK の成分ごとモード `CHECK law=resi
 「0×∞ かもしれない」ので SUNK を免れない (tot_mul の危険な0則)。BILIN/AXPY は
 フラグを **OR で合流**させるため、既存6命令の任意の組合せは非選択枝の札を
 必ず運んでしまう。TRIT の 0 は「このオペランドのビットを捨てる」という**選択の
-意味論**であり、算術には存在しない。乗算 0 本の純配線・HW では MUX+XOR。
+意味論**であり、算術には存在しない。乗算 0 本の純配線 — HW では SD 桁 × 語 の
+桁ごとの積そのもの: `out_p = tp·p ∨ tn·n / out_n = tp·n ∨ tn·p` (桁あたり AND4+OR2、
+`gate_fast.sd_trit` → 自動生成 `sd_trit.sv`)。さらに `tbm_core.sv` (197k ゲート・
+自動生成) は **BILIN×4成分 + AXPY + TRIT の基本命令ユニットを 1 枚のネットリストに
+並列同居**させた「一つの TBM」— run_everywhere が s も g=t⊙s も 4 実行系 bit一致で
+検証済 (敵対ラウンドでは汚れ札 45 個を 0 枝が真の零として廃棄・漏洩 0)。
 
 **SELECT は命令ではなくマクロ** (退化定理の拡張・機械はさらに小さい):
 
@@ -166,7 +171,7 @@ SUNK が必要と教えた。`orflag` は不合格側に貼る名札 (INEXACT �
 | AXPY | ✅ tot_add | ✅ | ✅ | ✅ `sd_add2` |
 | NORM | ✅ gate golden 委譲 | — | — | ✅ `blocknorm` |
 | CHECK | ✅ LAWS 4種 + residual行マスク | ✅ residual行マスク | ✅ LAWS 3種 (rank_exact 空欄) | — |
-| TRIT | ✅ (bit一致) | ✅ (bit一致) | — | — |
+| TRIT | ✅ (bit一致) | ✅ (bit一致) | ✅ (言語間bit一致) | ✅ `tbm_core` (並列同居・48ゲート/8桁) |
 | width ダイヤル | ✅ f64/f32 | ✅ | ✅ f64/f32 | (厳密整数 — 丸め自体なし) |
 
 適合水準: **L0** = bare で値一致 / **L1** = + coarse フラグ一致 / **L2** = + evidence bit一致。
@@ -199,7 +204,7 @@ CHECK が参照する `LAWS = {名前: (T, 作用) → 残差}`。既存 probe �
 
 ## 7. 適合試験 (旗艦デモの契約) — 実測済 ✅
 
-`run_everywhere.py`: 同一のプログラム (HW サブセット内の BILIN/AXPY/NORM 列・数十バイト) を
+`run_everywhere.py`: 同一のプログラム (HW サブセット内の BILIN/AXPY/TRIT/NORM 列・数十バイト) を
 3バックエンドでアセンブル実行し、
 
 1. 値: CPU↔GPU↔HW で diff = 0 (整数系入力では文字通り 0、実数系は f32 1ulp 以内を明記)

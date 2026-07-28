@@ -84,16 +84,20 @@ def gen_sed_comp_variants(ks=(0, 2, 3)):
 # ---------------------------------------------------------------- 本試験
 def main():
     print("run_everywhere — TBM 適合試験: 同じプログラム × 4 実行系 (CPU/GPU/Julia/HW)")
-    print("  プログラム: TOTALIZE a,b,c → s = a·b (セデニオン, evidence) → s += c → NORM(s[0:4])")
+    print("  プログラム: TOTALIZE a,b,c,t → s = a·b (セデニオン, evidence) → s += c"
+          " → g = t⊙s (TRIT) → NORM(s[0:4])")
     rng = np.random.default_rng(20260721)
     B = 6
     feed = {"in_a": rng.integers(-9, 10, (B, 16)),
             "in_b": rng.integers(-9, 10, (B, 16)),
-            "in_c": rng.integers(-9, 10, (B, 16))}
+            "in_c": rng.integers(-9, 10, (B, 16)),
+            "in_t": rng.integers(-1, 2, (B,))}
     P = (Program("mac_norm")
          .TOTALIZE("a", "in_a").TOTALIZE("b", "in_b").TOTALIZE("c", "in_c")
+         .TOTALIZE("t", "in_t")
          .BILIN("s", "a", "b", alg="sedenion", honesty="evidence")
          .AXPY("s", "c")
+         .TRIT("g", "t", "s")
          .NORM("n", "s", block=4, Ein=0))
 
     # ---- CPU / GPU
@@ -103,20 +107,35 @@ def main():
     sv_g, sf_g = gpu["s"].val.cpu().numpy(), gpu["s"].flag.cpu().numpy()
     assert np.array_equal(sv_c, sv_g), "CPU↔GPU 値 不一致"
     assert np.array_equal(sf_c, sf_g), "CPU↔GPU フラグ 不一致"
-    print(f"① CPU ↔ GPU: s 全 {B}×16 成分 値 bit一致・フラグ bit一致 ✓ (GPU NORM = {gpu['n']})")
+    gv_c, gf_c = cpu["g"].val.numpy(), cpu["g"].flag.numpy()
+    assert np.array_equal(gv_c, gpu["g"].val.cpu().numpy()), "CPU↔GPU TRIT 値 不一致"
+    assert np.array_equal(gf_c, gpu["g"].flag.cpu().numpy()), "CPU↔GPU TRIT フラグ 不一致"
+    assert np.array_equal(gv_c, sv_c * feed["in_t"][:, None].astype(np.float32)), \
+        "TRIT ≠ t·s"
+    print(f"① CPU ↔ GPU: s と g=t⊙s 全 {B}×16 成分 値 bit一致・フラグ bit一致 ✓ "
+          f"(GPU NORM = {gpu['n']})")
 
     # ---- 敵対ラウンド (0 除算相当の 危険ゼロ・Inf・NaN を 入口に)
     adv_a = feed["in_a"].astype(float).copy()
     adv_a[0, 0] = np.inf; adv_a[1, 3] = np.nan; adv_a[2, 5] = -np.inf
-    feed_adv = {"in_a": adv_a, "in_b": feed["in_b"], "in_c": feed["in_c"]}
+    feed_adv = {"in_a": adv_a, "in_b": feed["in_b"], "in_c": feed["in_c"],
+                "in_t": feed["in_t"]}
     P2 = (Program("adv").TOTALIZE("a", "in_a").TOTALIZE("b", "in_b")
-          .TOTALIZE("c", "in_c").BILIN("s", "a", "b", honesty="evidence").AXPY("s", "c"))
+          .TOTALIZE("c", "in_c").TOTALIZE("t", "in_t")
+          .BILIN("s", "a", "b", honesty="evidence").AXPY("s", "c")
+          .TRIT("g", "t", "s"))
     ca, ga = run(P2, feed_adv, "cpu"), run(P2, feed_adv, "gpu")
     assert np.array_equal(ca["s"].val.numpy(), ga["s"].val.cpu().numpy())
     assert np.array_equal(ca["s"].flag.numpy(), ga["s"].flag.cpu().numpy())
+    assert np.array_equal(ca["g"].val.numpy(), ga["g"].val.cpu().numpy())
+    assert np.array_equal(ca["g"].flag.numpy(), ga["g"].flag.cpu().numpy())
     nfl = int((ca["s"].flag.numpy() > 0).sum())
+    killed = int(((feed["in_t"] == 0)[:, None] * (ca["s"].flag.numpy() > 0)).sum())
     assert not np.isnan(ca["s"].val.numpy()).any() and not np.isinf(ca["s"].val.numpy()).any()
+    assert int(ca["g"].flag.numpy()[feed["in_t"] == 0].max(initial=0)) == 0, \
+        "TRIT の 0 枝から 札が 漏れた"
     print(f"② 敵対ラウンド (Inf/NaN 注入): NaN/Inf 非生成 ✓・立った札 {nfl} 個も CPU↔GPU bit一致 ✓")
+    print(f"   TRIT 0 枝: 汚れ札 {killed} 個を 真の零として 廃棄 (漏洩 0) — g も bit一致 ✓")
 
     # ---- Julia 脚 (言語間 適合: 同じ プログラムを Tbm.jl で — 敵対 込み)
     jl = os.environ.get("JULIA_BIN") or _find_julia()
@@ -127,10 +146,15 @@ def main():
         for arr in (adv_a, feed["in_b"].astype(float), feed["in_c"].astype(float)):
             bits = np.asarray(arr, dtype=np.float64).view(np.uint64)
             rows += [" ".join(str(x) for x in row) for row in bits]
+        rows.append("TRIT")
+        rows += [str(int(t)) for t in feed["in_t"]]
         rows.append("EXPECT")
         rows += [" ".join(str(x) for x in row)
                  for row in ca["s"].val.numpy().view(np.uint32)]
         rows += [" ".join(str(x) for x in row) for row in ca["s"].flag.numpy()]
+        rows += [" ".join(str(x) for x in row)
+                 for row in ca["g"].val.numpy().view(np.uint32)]
+        rows += [" ".join(str(x) for x in row) for row in ca["g"].flag.numpy()]
         with open(vec, "w") as fh:
             fh.write("\n".join(rows) + "\n")
         r = subprocess.run([jl, "--startup-file=no",
@@ -170,6 +194,18 @@ def main():
     assert np.array_equal(s_hw, sv_c[:, :4].astype(int)), "HW AXPY 不一致"
     print(f"   sd_add2: s = t + c の 4成分 ≡ CPU/GPU の s (bit一致の 連鎖が HW まで 届いた) ✓")
 
+    # ---- HW 脚: 一つの TBM コア (BILIN×4 + AXPY + TRIT が 1 ネットリストに 並列 同居)
+    core_cases = [{"a": feed["in_a"][i].tolist(), "b": feed["in_b"][i].tolist(),
+                   "c": feed["in_c"][i][:4].tolist(), "t": int(feed["in_t"][i])}
+                  for i in range(B)]
+    out = hw_module("tbm_core", {"cases": core_cases})
+    core_s = np.array([r["s"] for r in out["cases"]])
+    core_g = np.array([r["g"] for r in out["cases"]])
+    assert np.array_equal(core_s, sv_c[:, :4].astype(int)), "tbm_core s 不一致"
+    assert np.array_equal(core_g, gv_c[:, :4].astype(int)), "tbm_core g 不一致"
+    print(f"   tbm_core: 基本命令の 並列同居 (197k ゲート 1 モジュール) — s も g=t⊙s も "
+          f"CPU/GPU と 一致 ✓")
+
     # ---- HW 脚: NORM (blocknorm) + 敵対 (飽和フラグ)
     bn_cases = [{"m": [int(v) for v in sv_c[i, :4]], "Ein": 0} for i in range(B)]
     bn_cases.append({"m": [5_000_000, 3, -400_000, 7], "Ein": 0})       # 敵対: 桁あふれ
@@ -188,6 +224,7 @@ def main():
     print("    TOTALIZE     ✓     ✓     ✓      ✓ (入口 整数)")
     print("    BILIN(evid)  ✓     ✓     ✓      ✓ (sed_comp ×4)")
     print("    AXPY         ✓     ✓     ✓      ✓ (sd_add2)")
+    print("    TRIT         ✓     ✓     ✓      ✓ (tbm_core 並列同居)")
     print("    NORM         ✓     —     —      ✓ (blocknorm+フラグ)")
     print()
     print('  ✔ compile once, run on four executors, never lie.')

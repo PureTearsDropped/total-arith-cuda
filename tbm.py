@@ -225,7 +225,8 @@ def run(prog, feed, where="cpu", env0=None):
             else:
                 env[p["dst"]] = float(LAWS[p["law"]](**p["args"]))
         elif op == "TRIT":
-            t = env[p["t"]].to(torch.int8)
+            traw = env[p["t"]]
+            t = (traw.val if isinstance(traw, Tot) else traw).to(torch.int8)
             assert bool(torch.all((t >= -1) & (t <= 1))), "trit は {−1,0,+1} のみ"
             if p["comp"]:
                 t = (t == 0).to(torch.int8)                  # else 枝

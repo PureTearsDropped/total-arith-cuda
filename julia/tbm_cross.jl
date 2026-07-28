@@ -21,21 +21,30 @@ a = read_mat_u64(lines, 2, B, M)
 b = read_mat_u64(lines, 2 + B, B, M)
 c = read_mat_u64(lines, 2 + 2B, B, M)
 i0 = 2 + 3B
+@assert lines[i0] == "TRIT"
+t = reshape([parse(Float64, lines[i0 + r]) for r in 1:B], B, 1)
+i0 += 1 + B
 @assert lines[i0] == "EXPECT"
 ev = [parse.(UInt32, split(lines[i0 + r])) for r in 1:B]
 ef = [parse.(UInt8, split(lines[i0 + B + r])) for r in 1:B]
+gv = [parse.(UInt32, split(lines[i0 + 2B + r])) for r in 1:B]
+gf = [parse.(UInt8, split(lines[i0 + 3B + r])) for r in 1:B]
 
 P = Tbm.Program("cross")
 Tbm.TOTALIZE!(P, :a, :in_a); Tbm.TOTALIZE!(P, :b, :in_b); Tbm.TOTALIZE!(P, :c, :in_c)
+Tbm.TOTALIZE!(P, :t, :in_t)
 Tbm.BILIN!(P, :s, :a, :b; alg = :sedenion, honesty = :evidence)
 Tbm.AXPY!(P, :s, :c)
-env = Tbm.run_program(P, Dict(:in_a => a, :in_b => b, :in_c => c))
+Tbm.TRIT!(P, :g, :t, :s)
+env = Tbm.run_program(P, Dict(:in_a => a, :in_b => b, :in_c => c, :in_t => t))
 
 nv = 0; nf = 0
 for r in 1:B, k in 1:M
     global nv, nf
     nv += reinterpret(UInt32, env[:s].val[r, k]) != ev[r][k]
+    nv += reinterpret(UInt32, env[:g].val[r, k]) != gv[r][k]
     nf += env[:s].flag[r, k] != ef[r][k]
+    nf += env[:g].flag[r, k] != gf[r][k]
 end
-println("tbm_cross(julia): 値の不一致 $nv/$(B*M)  フラグの不一致 $nf/$(B*M)")
+println("tbm_cross(julia): 値の不一致 $nv/$(2B*M)  フラグの不一致 $nf/$(2B*M)  (s と g=t⊙s)")
 exit(nv == 0 && nf == 0 ? 0 : 1)
