@@ -7,3 +7,5 @@ results.xml
 *.vvp
 dump.fst
 .pytest_cache/
+.claude/
+.mcp.json
