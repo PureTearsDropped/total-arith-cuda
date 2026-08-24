@@ -15,6 +15,9 @@
   実行: python test_total_arith.py          （軽い ①〜⑤ だけ・GPU 不要）
         TOTAL_ARITH_SLOW=1 python test_total_arith.py   （各モジュールの self_test も 続けて）
   pytest が あれば pytest test_total_arith.py でも 同じ（test_* 関数の 集まり）。
+
+  **「変えたが 結果は 変わっていない」を 言いたいときは これでは 足りない** — ここは 規約の
+  検査であって 回帰の 検査ではない。二つの 版を 全数値で ビット比較するのは tools/ab_check.py。
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

@@ -332,7 +332,14 @@ def self_test():
     import numpy as np
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {dev} ({torch.cuda.get_device_name(0) if dev.type=='cuda' else 'CPU'})")
-    rng = np.random.default_rng(20260810)
+    # 標本は **既定で 固定**（TOTAL_ARITH_SEED=0）: 数字が 実行ごとに 動くと 「改修で 変わった
+    # のか 乱数か」が 判別できず、回帰検査に ならない。ただし オラクル検査は 本来 ファズなので
+    # 種を 変えて 別標本を 回せる 口を 開けておく（TOTAL_ARITH_SEED=1,2,… / 失敗したら 種を
+    # 添えて 報告すれば 再現できる）。⑥ の 疎マスクだけが torch の RNG を 使う。
+    SEED = int(os.environ.get("TOTAL_ARITH_SEED", "0"))
+    print(f"seed: {SEED} (TOTAL_ARITH_SEED で 別標本 — 0 が 既定の 再現可能な 標本)")
+    torch.manual_seed(1234 + SEED)
+    rng = np.random.default_rng(20260810 + SEED)
 
     print("=" * 76)
     print("① 全域化: NaN/Inf を 決して 出さない・フラグは 嘘をつかない（敵対的）")
@@ -446,7 +453,7 @@ def self_test():
     print("   フラグ付き入力の 許容真値集合から 真値を 乱択し、出力フラグの 主張と 照合")
     print("=" * 76)
     K = 200_000
-    rng5 = np.random.default_rng(11)
+    rng5 = np.random.default_rng(11 + SEED)
     def rand_flagged(K):
         """第3ラウンド監査の 盲点指摘を 反映: 表示0のフラグ付き(12%)・SUNK単独・
            GE|LE|SUNK・倍率は 10^6 まで・±MIN 近傍も 生成。"""
@@ -597,7 +604,7 @@ def self_test():
     print("⑥ 高レベル要素演算の GPU 化: ekernel_gpu ≡ nested_registry.ekernel (ビット一致契約)")
     from nested_registry import ekernel, Nel as _Nel
     import time as _time
-    rngk = np.random.default_rng(9)
+    rngk = np.random.default_rng(9 + SEED)
     sck = rngk.standard_normal(1_000_000) * 0.4 + 1.0
     sck[7] = 9.0                                              # 1成分 汚染
     for opn in ("exp", "sqrt", "log"):

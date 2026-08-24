@@ -173,7 +173,13 @@ python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 python cuda_total.py         # self-test: adversarial totality, algebra swap, throughput
 python test_total_arith.py   # boundary tests: index order, flag bridge, algebra swap
                              #   TOTAL_ARITH_SLOW=1 also runs every module's self_test
+python tools/ab_check.py     # "nothing changed": bitwise A/B of this tree vs main
+                             #   --negative-control checks that the check has teeth
 ```
+
+`self_test` draws a **fixed sample** by default so a number that moves means the code moved,
+not the dice; `TOTAL_ARITH_SEED=1` (2, 3, …) runs the same contracts on a different sample and
+prints the seed, so a failure is reproducible. See [`tools/README.md`](tools/README.md).
 
 Measured on an **RTX 5090**:
 
