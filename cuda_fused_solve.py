@@ -22,9 +22,10 @@ import torch
 import triton
 import triton.language as tl
 from cuda_total import Tot, GE, LE, SUNK, wiring_tensor
-
-SING_F = GE | LE | SUNK          # 「一意の厳密解なし(最小二乗)」を 既存語彙で: 境界なし+SUNK
-INEXACT_F = 0x08                 # 未収束/解なし検算不成立(HyperTranscend と 同じビット)
+# 「一意の厳密解なし(最小二乗)」= 順序層の 語彙で SING_F = GE|LE|SUNK(境界なし+符号不明)。
+# INEXACT_F は 順序層が 空けている bit3 への **合法な 相乗り**(検算層と 同じビット)。
+# 下位3ビット = 順序層 / bit3 = 検算層 という この混載規約は total_core の docstring に 明記。
+from total_core import SING_F, INEXACT_F
 
 
 @triton.jit

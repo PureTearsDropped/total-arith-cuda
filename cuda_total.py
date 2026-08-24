@@ -3,6 +3,9 @@
 """CUDA(torch) 全域算術 + 配線表ライブラリ — GPU 版の「配線＝計算」。
 
   ・数 = (val: float32, flag: uint8)。flag ビット: GE=1(≥) LE=2(≤) SUNK=4(符号不明)。
+    これは **順序層** の 語彙（値の 境界の 主張）。ekernel_gpu から 先は **検算層** の 語彙
+    (SING/CPLX/OVER/INEXACT = 計算に 何が 起きたかの 主張) に 変わる — ビットは 重なるが
+    意味は 別。ビット地図と 層間の 橋は `total_core.py` に 一本化（統合はしない）。
   ・全域化: overflow→±MAX+GE / underflow→±MIN(=ε・向き保持)+LE / a/0=0 / **NaN·Inf は 決して 出さない**。
   ・配線表 = 構造テンソル T[k,i,j]（σ(i,j)·δ_{k,i∘j}）。**T を 差し替えると 同じカーネルが
     複素/四元/セデニオン/行列積/畳み込みに 変わる**（wiring_registry の GPU 版）。
@@ -18,7 +21,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 import numpy as np
 import torch
 
-GE, LE, SUNK = 1, 2, 4
+# 旗の 語彙・Cayley–Dickson の 符号表・構造テンソルの 添字順は total_core が 唯一の 出典
+# （numpy のみ・torch 不要）。ここでは 後方互換のため 名前を そのまま 再輸出する。
+from total_core import (GE, LE, SUNK, NO_BOUND, UNKNOWN,          # noqa: F401
+                        cd_conj, cd_prod, cd_omega,               # noqa: F401
+                        to_kij, to_ijk, is_ternary, alg_kij)      # noqa: F401
+# 検算層の 語彙（下の _tot64 / ekernel_gpu から 先が この語彙に 変わる — 順序層と OR しない）
+from total_core import SING, OVER, INEXACT                        # noqa: F401
+
 F32 = torch.float32
 MAX = torch.finfo(F32).max            # 飽和天井
 MIN = torch.finfo(F32).tiny           # ε = 最小正規数（向き付き 無限小）
@@ -148,50 +158,55 @@ def tot_div(a, b):
 
 
 # ---------------------------------------------------------------- 配線表（構造テンソル）
-# Cayley–Dickson 構成（自己完結・nd_algebra と 同一規約: (a,b)(c,d) = (ac − d̄b, da + bc̄)）
-def _cd_conj(x):
-    n = len(x)
-    if n == 1: return x.copy()
-    h = n // 2
-    return np.concatenate([_cd_conj(x[:h]), -x[h:]])
+# Cayley–Dickson の 実装 (cd_conj / cd_prod / cd_omega) は total_core に 一本化。
+# **添字順**: ここ (torch 側) は T[k,i,j]。numpy 側 (`Alg.T`) は T[i,j,k] — 転置している。
+# 変換は total_core.to_kij / to_ijk の 一箇所だけ。理由と 対応表は total_core の docstring。
+def wiring_tensor(kind, M=None, device=None, ternary=True):
+    """配線表 T[k,i,j]。**T を 差し替えると 同じカーネルが 別の 代数に なる**。
 
-def _cd_prod(x, y):
-    n = len(x)
-    if n == 1: return x * y
-    h = n // 2
-    a, b, c, d = x[:h], x[h:], y[:h], y[h:]
-    return np.concatenate([_cd_prod(a, c) - _cd_prod(_cd_conj(d), b),
-                           _cd_prod(d, a) + _cd_prod(b, _cd_conj(c))])
+       kind:
+         'cd'      Cayley–Dickson (XOR 経路) — ℂ/ℍ/𝕆/セデニオン  … M 必須
+         'cyclic'  巡回畳み込み ℤ/M                              … M 必須
+         Alg       nested_registry の 代数 (`.T` = T[i,j,k]) を そのまま — M は 検査のみ
+         str       上以外の 文字列は nested_registry.ALGS の プリセット名として 引く
+                   ('cl3', 'grassmann2', 'dualquat', 'sedenion', …)
 
-def cd_omega(M):
-    """符号表 OMEGA[i,j] ∈ {−1,+1}, 経路 = i⊕j（XOR routing）。"""
-    E = np.eye(M)
-    OM = np.zeros((M, M), dtype=int)
-    for i in range(M):
-        for j in range(M):
-            v = _cd_prod(E[i], E[j])
-            k = int(np.argmax(np.abs(v)))
-            assert k == (i ^ j), f"XOR routing 破れ M={M} ({i},{j})"
-            OM[i, j] = int(np.sign(v[k]))
-    return OM
-
-def wiring_tensor(kind, M, device):
-    """配線表 T[k,i,j]。kind: 'cd'（Cayley–Dickson XOR経路）/ 'cyclic'（巡回畳み込み）。"""
-    T = torch.zeros(M, M, M, dtype=torch.float32, device=device)
-    if kind == "cd":
+       ternary=True: 配線正規形の 門番 (TBM_SPEC §1.5) — 係数が {−1,0,+1} でなければ 拒否。
+       jordan()/tensor() 由来の 表は 係数 ½ を 持つので ternary=False が 要る（配線段に
+       乗算器が 要る＝「配線＝計算」が 成り立たない、を 黙って 通さないための 門）。"""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(kind, str) and kind == "cd":
+        assert M is not None, "'cd' には M が 要る"
         OM = cd_omega(M)
+        Tn = np.zeros((M, M, M))
         for i in range(M):
             for j in range(M):
-                T[i ^ j, i, j] = float(OM[i, j])
-    elif kind == "cyclic":
+                Tn[i ^ j, i, j] = float(OM[i, j])
+        name = f"cd{M}"
+    elif isinstance(kind, str) and kind == "cyclic":
+        assert M is not None, "'cyclic' には M が 要る"
+        Tn = np.zeros((M, M, M))
         for i in range(M):
             for j in range(M):
-                T[(i + j) % M, i, j] = 1.0
+                Tn[(i + j) % M, i, j] = 1.0
+        name = f"cyc{M}"
     else:
-        raise ValueError(kind)
+        A = kind
+        if isinstance(A, str):                       # プリセット名 → nested_registry の 棚
+            from nested_registry import ALGS
+            if A not in ALGS:
+                raise ValueError(f"未知の 配線: {A!r} (ALGS: {sorted(ALGS)})")
+            A = ALGS[A]()
+        Tn = alg_kij(A)                              # T[i,j,k] → T[k,i,j] （唯一の 変換点）
+        name = getattr(A, "name", str(kind))
+        if M is not None:
+            assert Tn.shape[0] == M, f"次元 不一致: {name} は dim {Tn.shape[0]}・M={M}"
     # 配線正規形の門番 (TBM_SPEC §1.5): 三値なら配線段に係数丸めが無い＝厳密
-    assert set(torch.unique(T).tolist()) <= {-1.0, 0.0, 1.0}, f"三値正規形 破れ: {kind}"
-    return T
+    if ternary:
+        assert is_ternary(Tn), (f"三値正規形 破れ: {name} — 係数に ±1/0 以外が ある。"
+                                " 配線段に 乗算器が 要る (ternary=False で 明示的に 許可)")
+    return torch.as_tensor(Tn, dtype=torch.float32, device=device)
 
 def group_mul(T, a, b):
     """配線積（バッチ）: c[...,k] = Σ_ij T[k,i,j]·a[...,i]·b[...,j]。
@@ -261,15 +276,19 @@ def group_mul(T, a, b):
 # ---------------------------------------------------------------- 自己テスト
 # ============================================================ 高レベル要素演算の GPU 化
 def _tot64(v, f):
-    "nested_registry._tot の torch/f64/成分ごと 版 (SING=0x01, OVER=0x04)"
+    """nested_registry._tot の torch/f64/成分ごと 版。
+
+       **旗の 語彙は ここから 検算層に 変わる** (SING/OVER/INEXACT)。上の Tot が 使う
+       順序層 (GE/LE/SUNK) と ビットは 重なるが 意味は 違う — 二つを OR してはならない。
+       層の 対応表と 橋 (total_core.to_order / to_verify) は total_core の docstring。"""
     nan = torch.isnan(v)
     v = torch.where(nan, torch.zeros_like(v), v)
-    f = f | nan.to(torch.uint8) * 0x01
+    f = f | nan.to(torch.uint8) * SING
     ovf = ~torch.isfinite(v)
     v = torch.where(ovf, torch.sign(v) * torch.finfo(torch.float64).max, v)
-    return v, f | ovf.to(torch.uint8) * 0x04
+    return v, f | ovf.to(torch.uint8) * OVER
 
-def ekernel_gpu(name, arr, order=None, device="cuda"):
+def ekernel_gpu(name, arr, order=None, device=None):
     """nested_registry.ekernel (高レベル演算の スカラー胞 = 1×1 = 数 の カーネル化) の GPU 双子。
        契約: 同じ テープ・同じ 蓄積順序を f64 の torch で — **値は numpy 版と ビット一致**
        (self_test が 恒久検査)。フラグは nested 意味論 (SING/OVER/INEXACT) を **成分ごと** に
@@ -277,6 +296,8 @@ def ekernel_gpu(name, arr, order=None, device="cuda"):
        一致 — これも 検査)。name: nested_registry.OPS の 演算名 or 配列関数 f(tensor)→tensor
        (任意関数too — 中身は 黒箱でも 入口/出口の 税関で 嘘は 出ない)。戻り (値tensor, 旗tensor)。"""
     from nested_registry import OPS
+    if device is None:                                # CPU フォールバックでも 走る (GPU 不在時)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     v = arr.to(torch.float64) if torch.is_tensor(arr) else \
         torch.as_tensor(np.asarray(arr, float), dtype=torch.float64, device=device)
     v, fl = _tot64(v, torch.zeros(v.shape, dtype=torch.uint8, device=v.device))
@@ -305,7 +326,7 @@ def ekernel_gpu(name, arr, order=None, device="cuda"):
     else:
         resid = (acc * v - 1.0).abs()
     bad = ~(resid < 1e-6)                                     # NaN too 破れ扱い
-    return acc, fl | bad.to(torch.uint8) * 0x08              # INEXACT
+    return acc, fl | bad.to(torch.uint8) * INEXACT
 
 def self_test():
     import numpy as np

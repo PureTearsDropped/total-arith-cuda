@@ -29,12 +29,15 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from scipy.linalg import expm, logm, fractional_matrix_power, funm
-from cuda_total import cd_omega                      # the Cayley–Dickson sign table (shared)
+# The shared conventions (flag vocabulary, Cayley–Dickson sign table) live in total_core.
+#   SING   = L_x singular ⇒ no unique inverse (zero divisor)
+#   CPLX   = result left the reals (imag residue) ⇒ go to a bigger field
+#   OVER   = a component saturated to ±MAX (range overflow) / NaN at entry
+#   INEXACT= candidate: the defining algebraic identity was NOT verified
+# This is the *verify* vocabulary; `cuda_total.Tot` speaks the *order* one (GE/LE/SUNK).
+# The bits overlap with different meanings — see total_core for the map and the bridge.
+from total_core import SING, CPLX, OVER, INEXACT, cd_omega
 
-SING   = 0x01     # L_x singular ⇒ no unique inverse (zero divisor)
-CPLX   = 0x02     # result left the reals (imag residue) ⇒ go to a bigger field
-OVER   = 0x04     # a component saturated to ±MAX (range overflow) / NaN at entry
-INEXACT = 0x08    # candidate: the defining algebraic identity was NOT verified
 MAXF = float(np.finfo(np.float64).max)
 
 

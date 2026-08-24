@@ -114,11 +114,65 @@ table*, nothing hand-written per algebra:
 Everything above runs unchanged over `mat_over(cell, N)` (matrices over your algebra),
 tensor compositions, and all ALGS shelf citizens.
 
+### `total_core.py` — one convention for two halves (2026-08-24)
+
+This repository has two halves that speak **different flag languages on purpose**, and a
+second external review asked the fair question: *what does a flag mean here versus there?*
+The answer is not to merge them — they assert different things — but to write the map down
+once and machine-check it. `total_core.py` (numpy only, no torch) is that one place.
+
+| bit | order layer (`cuda_total.Tot`, GPU) | verify layer (`nested_registry.Nel` / `Hyper`) |
+|-----|------------------------------------|-----------------------------------------------|
+|0x01 | `GE` — true value is **≥** this    | `SING` — no unique inverse/solution (zero divisor) |
+|0x02 | `LE` — true value is **≤** this    | `CPLX` — the result left the reals             |
+|0x04 | `SUNK` — sign unknown              | `OVER` — saturated at ±MAX                     |
+|0x08 | *(unused — free bit)*              | `INEXACT` — the defining identity was **not** verified |
+
+The order layer states **bounds on a value**; the verify layer states **what happened to a
+computation**. Same bits, different meanings — so the two words must never be OR'ed. The one
+legal exception is bit 3: the order layer never uses it, which is why `cuda_fused_solve` can
+ride `INEXACT` alongside `GE|LE|SUNK` in a single `uint8` (documented, no longer a bare
+magic number).
+
+`to_verify` / `to_order` bridge the two, and the correspondence is **not** a bijection:
+`GE|LE|SUNK` ⇔ `SING` is the only point where the meanings coincide; `GE` and `LE` both
+collapse to `OVER` (direction is lost); `INEXACT` and `CPLX` have **no order-layer image at
+all** — they are claims about a verification, not bounds on a value. So `to_order` returns
+`(flag, residue)` and never drops those bits silently. A test asserts the bridge only ever
+*weakens* a claim.
+
+Two more shared conventions moved here, and both were quietly split before:
+
+- **The structure tensor's index order.** The numpy half carries `Alg.T[i,j,k]` ("the
+  coefficient of e_k in e_i·e_j"); the GPU half carries `wiring_tensor` as `T[k,i,j]` (so the
+  pattern rule in `group_mul` can take output row `T[k]` in one slice). Both orders are right
+  for their side, so they stay — but they are now *named* (`T_ijk` / `T_kij`), converted in
+  exactly one place (`to_kij` / `to_ijk`), and checked against each other for every algebra.
+  An einsum does not care if you transpose a cube, which is why this needed a test rather
+  than a convention.
+- **Cayley–Dickson.** There were two implementations; the second one (in `nested_registry`)
+  turned out to be dead code. One survives, and a test builds the table *both* ways — XOR
+  routing (`cd_omega`) and the exhaustive basis product (`cd_prod`, the path the Julia twin
+  takes) — and asserts they agree.
+
+**Consequence, not just tidying:** `wiring_tensor` now accepts *any* `Alg` (or a preset name),
+so Clifford, Grassmann/dual numbers, `mat_n`, and tensor compositions run on the GPU kernel —
+before this, the "swap T, get a different algebra" claim held only for `'cd'` and `'cyclic'`
+on the CUDA side. The ternary gate (TBM_SPEC §1.5) still guards the door: a table with ½
+coefficients (`jordan(mat2)`) is refused unless you pass `ternary=False` and say so out loud.
+
+日本語: 二つの旗の語彙は**統合しない**（別のことを主張しているため）。統合の代わりに、ビット
+地図・層間の橋・構造テンソルの添字順・Cayley–Dickson の符号表を `total_core.py` の一箇所に
+置き、`test_total_arith.py` が両半身の一致を恒久検査する。副産物として numpy 側は torch を
+要求しなくなり、任意の代数が GPU カーネルに載るようになった。
+
 ### Reproduce
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
 python cuda_total.py         # self-test: adversarial totality, algebra swap, throughput
+python test_total_arith.py   # boundary tests: index order, flag bridge, algebra swap
+                             #   TOTAL_ARITH_SLOW=1 also runs every module's self_test
 ```
 
 Measured on an **RTX 5090**:
@@ -399,9 +453,11 @@ an issue reporting the result (either way) is welcome.
 
 **総ビリニア機械（TBM）**: 全6命令（掛け算はBILIN 1つ——「掛け算しかできない」ではなく「掛け算の意味論は1つで足りる」の意）。exp/solve/FFT/法則発見は全部「プログラム（マクロ）」。全命令が誠実さのダイヤル（証拠級/粗/裸）を持つ——誠実さの税金は一枚岩でなく傾斜だから（実測: 証拠級は制御ループ帯でタダ・大バッチ37×、粗は1.13×≒タダ）。`tbm.py` がアセンブラ、`run_everywhere.py` が適合試験で、**同じプログラムが CPU / GPU（融合Triton）/ 自動生成SystemVerilogゲート（RTLシミュ）で値・フラグともbit一致**（敵対的Inf/NaN注入込み・2026-07-21合格）。*Compile once, run on three silicons, never lie.*
 
+- **規約は一箇所** (`total_core.py`, numpy のみ): 旗の二語彙（順序層 `GE/LE/SUNK` = 値の境界の主張 ／ 検算層 `SING/CPLX/OVER/INEXACT` = 計算に何が起きたかの主張）は**統合せず**、ビット地図と層間の橋 `to_verify`/`to_order` を書いて機械検査する。橋は全単射でなく、像を持たない旗（`INEXACT`/`CPLX`）は `residue` で返して黙って捨てない。構造テンソルの添字順（numpy `T[i,j,k]` ／ torch `T[k,i,j]`）も同様に、統一せず**名前で区別して変換を一点に**置き `test_total_arith.py` が両半身の一致を検査する。副産物: numpy 側が torch を要求しなくなり、任意の `Alg`（Clifford・Grassmann・行列代数・テンソル積）が `wiring_tensor` 経由でそのまま GPU カーネルに載る。
+
 ### 再現方法
 
-上記コマンド。RTX 5090 実測値は上段の通り。CUDA GPU 必須（CPUフォールバックは正しさは保つがスループット値は出ない）。
+上記コマンド。RTX 5090 実測値は上段の通り。CUDA GPU 必須（CPUフォールバックは正しさは保つがスループット値は出ない）。境界検査は `python test_total_arith.py`（GPU 不要・`TOTAL_ARITH_SLOW=1` で各モジュールの self_test も続けて走る）。
 
 ---
 

@@ -21,6 +21,13 @@ this is its generalization.)
   combination — nothing is assumed.  Elements are total: NaN→0+SING, overflow→±MAX+OVER
   at every step; candidates verify their defining identity or carry INEXACT.
 
+  This is the *verify* flag vocabulary (what happened to a computation).  The GPU half
+  (`cuda_total.Tot`) speaks the *order* one (GE/LE/SUNK — bounds on a value); the bits
+  overlap with different meanings, so the two words are never OR'ed.  Bit map, bridge,
+  and the structure-tensor index convention (here T[i,j,k], there T[k,i,j]) all live in
+  `total_core.py`; `test_total_arith.py` checks the two halves against each other.
+  Any Alg built here runs on the GPU kernel as-is: `wiring_tensor(alg('cl3'))`.
+
   Measured laws replicated from the Julia twin (self_test asserts them):
     · exp∘log verifies  ⟺  power-associativity holds (associativity NOT required —
       octonion/sedenion scalars pass at 1e-16)
@@ -33,9 +40,10 @@ this is its generalization.)
 import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
-from cuda_total import cd_omega
+# 規約 (旗の 語彙・Cayley–Dickson の 符号表) は total_core が 唯一の 出典。
+# **numpy だけで 完結する** — 以前は cuda_total 経由で torch を 引きずっていた。
+from total_core import SING, CPLX, OVER, INEXACT, cd_omega, cd_prod, cd_conj  # noqa: F401
 
-SING, OVER, INEXACT = 0x01, 0x04, 0x08
 MAXF = float(np.finfo(np.float64).max)
 
 
@@ -82,15 +90,9 @@ def Rmat(A, xc):
     return np.einsum("j,ijk->ki", np.asarray(xc, float), A.T)
 
 # ================================================================ N layer: cell registry
-def _cdconj(x): return np.concatenate([x[:1], -x[1:]]) if len(x) > 1 else x.copy()
-def _cdprod(x, y):
-    n = len(x)
-    if n == 1: return x * y
-    h = n // 2
-    a, b, c, d = x[:h], x[h:], y[:h], y[h:]
-    return np.concatenate([_cdprod(a, c) - _cdprod(_cdconj(d), b),
-                           _cdprod(d, a) + _cdprod(b, _cdconj(c))])
-
+# （Cayley–Dickson の 積 cd_prod / 共役 cd_conj は total_core に 一本化。ここに あった
+#   二つ目の 実装は 死にコードだった — cd_alg は 昔から cd_omega しか 呼んでいない。
+#   両者が 同じ 表を 与えることは test_total_arith が 恒久検査する。）
 def cd_alg(M):
     "Cayley–Dickson: ℝ(1) ℂ(2) ℍ(4) 𝕆(8) sedenion(16) — wiring table via cd_omega"
     OM = cd_omega(M)
