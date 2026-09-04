@@ -4,7 +4,9 @@ TotArith — a scalar total-arithmetic Number for Julia.
 
   `TotNum <: Real`: value + a flag that names when the true value left the machine's
   representable range, WITH direction.  Overflow → ±MAX + GE (|true| ≥ |val|);
-  underflow → ±MIN + LE (|true| ≤ |val|); a/0 = 0; NaN/Inf are never produced.
+  underflow → ±MIN + LE (|true| ≤ |val|) — also when Float64 itself has already collapsed
+  to an exact 0 (1e-200², exp(−750)); a/0 = 0, log 0 = 0 (the reserved word 0 is a value,
+  not a limit — the limits live in ε = ±MIN⟦≤⟧); ℂ is sticky; NaN/Inf are never produced.
 
   Because it subtypes `Real` and overloads `Base.:+ - * /` etc., *existing generic
   Julia code runs on it unchanged* — the flag flows through any library that is written
@@ -17,6 +19,8 @@ export TotNum, GE, LE, SUNK, isflagged, flag_of, MAXF, MINF
 const GE   = 0x01
 const LE   = 0x02
 const SUNK = 0x04
+const CPLX = 0x08   # "真の結果が real 欄に収まらない(可能性を含む)" — √-1型は確定・符号不明入力は可能性
+const NOB  = GE | LE                              # no bound in either direction
 const MAXF = floatmax(Float64)
 const MINF = floatmin(Float64)
 
@@ -26,6 +30,13 @@ struct TotNum <: Real
 end
 TotNum(x::Real) = _entry(Float64(x))          # entry totalization at construction
 TotNum(x::TotNum) = x
+
+# ℂ の席: 値の欄は空(0 は placeholder)・境界なし・符号不明・ℂ。**ℂ は粘る**: ℂ を一度出た値に
+# 実数の演算を当てても実数には戻れない(2026-09-03 監査: exp(log −1) = 1, log(−1)·2 = 0, √−4·√−4 = 0
+# と placeholder の 0 が本物の 0 として消費されていた)。ℂ 入力を持つ演算は全部この席を返す。
+const ZCPLX = TotNum(0.0, NOB | SUNK | CPLX)
+@inline _cplx(a::TotNum) = (a.flag & CPLX) != 0
+@inline _cplx(a::TotNum, b::TotNum) = ((a.flag | b.flag) & CPLX) != 0
 
 flag_of(a::TotNum) = a.flag
 isflagged(a::TotNum) = a.flag != 0x00
@@ -46,6 +57,12 @@ Base.big(a::TotNum) = big(a.val)
     return TotNum(raw, 0x00)
 end
 @inline _entry(x::Float64) = _sat(x)
+# A raw 0 whose true value is NOT zero: Float64 ran out of subnormals (1e-200·1e-200,
+# exp(−750), 0.5^2000 …).  `_sat` cannot tell that 0 from a true zero, so the CALLER decides
+# from its operands (both nonzero ⇒ the product is nonzero) and totalizes it here: the result
+# is ε = ±MIN⟦≤⟧, direction kept — never an unflagged 0.  (2026-09-03 audit: × ÷ ^ exp lied.)
+@inline _uflow(raw::Float64) = TotNum(signbit(raw) ? -MINF : MINF, LE)
+@inline _sat_nz(raw::Float64) = raw == 0 ? _uflow(raw) : _sat(raw)   # for a result known ≠ 0
 
 @inline function _addflag(fa, fb, va, vb)
     fin = fa | fb
@@ -65,23 +82,29 @@ end
 
 # ---- the operator overloads: THIS is the bridge to the whole ecosystem ----
 function Base.:+(a::TotNum, b::TotNum)
-    r = _sat(a.val + b.val)
+    _cplx(a, b) && return ZCPLX
+    r = _sat(a.val + b.val)                      # (x + y = 0 ⇒ x = −y exactly: no silent underflow here)
     TotNum(r.val, r.flag | _addflag(a.flag, b.flag, a.val, b.val))
 end
 function Base.:-(a::TotNum, b::TotNum)
+    _cplx(a, b) && return ZCPLX
     r = _sat(a.val - b.val)
     TotNum(r.val, r.flag | _addflag(a.flag, b.flag, a.val, -b.val))
 end
 Base.:-(a::TotNum) = TotNum(-a.val, a.flag)
 function Base.:*(a::TotNum, b::TotNum)
-    r = _sat(a.val * b.val)
+    _cplx(a, b) && return ZCPLX
     tz = (a.val == 0 && (a.flag & GE) == 0) || (b.val == 0 && (b.flag & GE) == 0)
-    tz ? TotNum(0.0, 0x00) : TotNum(r.val, r.flag | _mulflag(a.flag, b.flag))
+    tz && return TotNum(0.0, 0x00)               # a true zero absorbs (0·MAX⟦≥⟧ = 0 by definition)
+    raw = a.val * b.val
+    r = (a.val != 0 && b.val != 0) ? _sat_nz(raw) : _sat(raw)   # nonzero·nonzero ≠ 0: a 0 is underflow
+    TotNum(r.val, r.flag | _mulflag(a.flag, b.flag))
 end
 function Base.:/(a::TotNum, b::TotNum)
+    _cplx(a, b) && return ZCPLX
     bz = b.val == 0
     raw = bz ? 0.0 : a.val / b.val               # a/0 = 0
-    r = _sat(raw)
+    r = (!bz && a.val != 0) ? _sat_nz(raw) : _sat(raw)          # nonzero/nonzero ≠ 0
     fin = a.flag | b.flag
     nb = (fin & (GE | LE)) > 0
     dz = (a.val == 0 && (a.flag & GE) > 0) || (b.val == 0 && (b.flag & GE) > 0)
@@ -101,27 +124,27 @@ Base.:<(a::TotNum, b::TotNum) = a.val < b.val
 Base.:<=(a::TotNum, b::TotNum) = a.val <= b.val
 Base.:(==)(a::TotNum, b::TotNum) = a.val == b.val
 Base.isless(a::TotNum, b::TotNum) = a.val < b.val
-Base.abs(a::TotNum) = TotNum(abs(a.val), a.flag)
-Base.sign(a::TotNum) = TotNum(sign(a.val), (a.flag & SUNK))
+Base.abs(a::TotNum) = _cplx(a) ? ZCPLX : TotNum(abs(a.val), a.flag)   # |z| の値は席に無い
+Base.sign(a::TotNum) = _cplx(a) ? ZCPLX : TotNum(sign(a.val), (a.flag & SUNK))
 # ---- transcendental flag algebra --------------------------------------------------------
 # GE/LE are ABSOLUTE-VALUE bounds. They survive a function ONLY when the function is
 # monotone on the admissible set AND the direction survives |·| — that must be PROVEN per
 # function, not assumed. Principle (external audit 2026-07-20, five confirmed lies):
 # when it cannot be proven, drop to GE|LE|SUNK (no bound, sign untrusted) — an honest
 # "I know nothing" beats a stale direction.
-const CPLX = 0x08   # "真の結果が real 欄に収まらない(可能性を含む)" — √-1型は確定・符号不明入力は可能性
-const NOB  = GE | LE                              # no bound in either direction
 
 # 符号を信用できない入力(SUNK / 危険な0)は、定義域が符号に敏感な関数では
 # 「真値が負→実数の外」の可能性を持つ ⇒ CPLX まで立てるのが健全 (意味論オラクルで強制)
 @inline _sign_untrusted(a::TotNum) = (a.flag & SUNK) != 0 || (a.val == 0 && (a.flag & GE) != 0)
 
 function Base.sqrt(a::TotNum)
+    _cplx(a) && return ZCPLX
     if a.val < 0                                            # 定義域外: 複素へ、と名指し
         # 符号不明なら 真値が正で実結果もあり得る → 古い方向ビットを残さず NOB に落とす
         return (a.flag & SUNK) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) : TotNum(0.0, a.flag | CPLX)
     end
     _sign_untrusted(a) && return TotNum(sqrt(a.val), NOB | SUNK | CPLX)
+    a.val == 0 && return TotNum(0.0, 0x00)                  # (0,≤) ⇒ true = 0 ⇒ √ is exactly 0 (as exp's (0,≤) ⇒ 1)
     # sign trusted, val ≥ 0: |·|^½ is monotone in magnitude → direction bits survive
     r = _sat(sqrt(a.val))
     TotNum(r.val, r.flag | (a.flag & (GE | LE)))
@@ -132,15 +155,15 @@ function Base.:^(a::TotNum, b::TotNum)
     # 指数=0 の 二種を 分ける（"0を予約語に"の 帰結）: 本物の0 だけが 空の積=1。
     # 指数が 整数だが Int64 に 収まらない(1e300 等) → 実数冪 exp(y·log x) の 経路へ
     # (旧版は isinteger(y) で 整数扱い→Int64(y) が InexactError を 投げた・全域監査で 発覚)
-    if y == 0
-        if b.flag == 0x00                          # 指数が **本物の0** → 空の積 → 1 (0^0 も 1)
-            return TotNum(1.0, a.flag & SUNK)      # (底の 符号不明だけは 伝播・大きさは 1 で 確定)
-        else                                       # 指数が **潰れた≈0(±MIN)** = 微小な非ゼロ → 空の積でない
-            if x == 0 && a.flag == 0x00            #   0^(微小): 符号+なら0/−なら∞ → 割れる
-                return TotNum(0.0, GE | LE | SUNK) #   確定できない → 境界なし+符号不明
-            else                                   #   有限底: a^(微小) ≈ 1 (連続)
-                return TotNum(1.0, inflag)
-            end
+    if y == 0 && b.flag == 0x00                    # 指数が **本物の0** → 空の積 → 1 (0^0 も 1, z^0 も 1)
+        return TotNum(1.0, a.flag & SUNK)          # (底の 符号不明だけは 伝播・大きさは 1 で 確定)
+    end
+    _cplx(a, b) && return ZCPLX                    # ℂ は粘る(z^0 = 1 だけが上で抜ける)
+    if y == 0                                      # 指数が **潰れた≈0(±MIN)** = 微小な非ゼロ → 空の積でない
+        if x == 0 && a.flag == 0x00                #   0^(微小): 符号+なら0/−なら∞ → 割れる
+            return TotNum(0.0, GE | LE | SUNK)     #   確定できない → 境界なし+符号不明
+        else                                       #   有限底: a^(微小) ≈ 1 (連続)
+            return TotNum(1.0, inflag)
         end
     end
     if x < 0 && !isinteger(y)                     # (負)^(非整数) = 実数の範囲外 → 型が違う
@@ -154,7 +177,8 @@ function Base.:^(a::TotNum, b::TotNum)
     end
     # 負の底の 符号: 指数の 偶奇で 決まる。y が Int64 外(1e300 等)なら 実質 偶数扱いで 安全
     s = (x < 0 && abs(y) < 9e18 && isodd(round(Int, y))) ? -1.0 : 1.0
-    r = _sat(s * abs(x)^y)                         # 溢れ→±MAX·GE / 潰れ→±MIN·LE を _sat が担当
+    raw = s * abs(x)^y
+    r = x != 0 ? _sat_nz(raw) : _sat(raw)          # 溢れ→±MAX·GE / 潰れ→±MIN·LE (x≠0 なら 0 は潰れ)
     if b.flag != 0x00
         return TotNum(r.val, r.flag | NOB | SUNK)  # 指数が不確か: 方向を主張できない
     end
@@ -181,15 +205,18 @@ end
 end
 function Base.:^(a::TotNum, n::Integer)
     n == 0 && return TotNum(1.0, 0x00)             # x^0 = 1 exact (0^0 = 1: 空の積)
+    _cplx(a) && return ZCPLX
     if a.val == 0 && n < 0                          # 0^(−n) = 1/0 = 0 (Moore-Penrose と整合)
         return a.flag == 0x00 ? TotNum(0.0, 0x00) : TotNum(0.0, NOB | SUNK)
     end
-    r = _sat(a.val^n)
+    raw = a.val^n
+    r = a.val != 0 ? _sat_nz(raw) : _sat(raw)      # x ≠ 0 ⇒ x^n ≠ 0: a 0 is underflow → ±MIN⟦≤⟧
     TotNum(r.val, r.flag | _powflag(a.flag, Float64(n)))
 end
 Base.literal_pow(::typeof(^), a::TotNum, ::Val{N}) where {N} = a^N
 function Base.exp(a::TotNum)
-    r = _sat(exp(a.val))
+    _cplx(a) && return ZCPLX
+    r = _sat_nz(exp(a.val))                        # e^x > 0 always: exp(−MAX) = +MIN⟦≤⟧, never 0
     f = a.flag
     f == 0x00 && return r
     # exp > 0 always ⇒ output sign is CERTAIN (SUNK never propagates out); but the
@@ -208,12 +235,17 @@ function Base.exp(a::TotNum)
     TotNum(r.val, r.flag | out)
 end
 function Base.log(a::TotNum)
+    _cplx(a) && return ZCPLX
     if a.val < 0                                            # 実数範囲外: 複素へ
         return (a.flag & SUNK) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) : TotNum(0.0, a.flag | CPLX)
     end
     if a.val == 0
-        # 本物の0: log0 = −∞ → −MAX+GE ; 危険な0(GE付き): 真値不明(負なら複素) → NOB|SUNK|CPLX
-        return (a.flag & GE) != 0 ? TotNum(0.0, NOB | SUNK | CPLX) : TotNum(-MAXF, GE)
+        # 本物の0: 予約語 → log 0 = 0 (定義則, a/0 = 0 と同じ棚; 2026-09-03 決定).  −∞ は 0 の
+        # 仕事ではなく ε = MIN⟦≤⟧ の仕事: log(ε) = log MIN⟦≥⟧ が下の旗規則から出る.  (0 は反転
+        # 1/0 = 0 の不動点なので log(1/x) = −log x を守る値は v = −v ⟹ 0 だけ; 級数は形ごとに
+        # ∓∞ に割れて向きを決められない — 向きは ε が運ぶ.)  (2026-07-20 版の −MAX⟦≥⟧ は撤回.)
+        # 危険な0(GE付き): 真値不明(負なら複素) → NOB|SUNK|CPLX
+        return (a.flag & GE) != 0 ? ZCPLX : TotNum(0.0, 0x00)
     end
     r = _sat(log(a.val))
     f = a.flag
@@ -234,8 +266,8 @@ end
 # periodic: an input magnitude-bound says (almost) NOTHING about the output — the
 # admissible set can cross any number of periods (audit counterexample ④: sin(π/2,GE)
 # claimed +1⟦≥⟧ while the truth allows sin(3π/2) = −1). Flagged input ⇒ NOB|SUNK.
-Base.sin(a::TotNum) = a.flag == 0x00 ? TotNum(sin(a.val), 0x00) : TotNum(sin(a.val), NOB | SUNK)
-Base.cos(a::TotNum) = a.flag == 0x00 ? TotNum(cos(a.val), 0x00) : TotNum(cos(a.val), NOB | SUNK)
+Base.sin(a::TotNum) = _cplx(a) ? ZCPLX : a.flag == 0x00 ? TotNum(sin(a.val), 0x00) : TotNum(sin(a.val), NOB | SUNK)
+Base.cos(a::TotNum) = _cplx(a) ? ZCPLX : a.flag == 0x00 ? TotNum(cos(a.val), 0x00) : TotNum(cos(a.val), NOB | SUNK)
 Base.inv(a::TotNum) = one(TotNum) / a
 Base.:*(a::TotNum, b::Bool) = b ? a : zero(TotNum)   # solvers multiply by Bool masks
 Base.:*(b::Bool, a::TotNum) = b ? a : zero(TotNum)
