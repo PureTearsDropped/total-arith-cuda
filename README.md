@@ -339,6 +339,85 @@ python hyper_transcend.py            # per-dimension identity self-test (M = 1..
 python hyper_transcend.py --audit    # adversarial totality audit → NaN/Inf 0, exceptions 0, false-flags 0
 ```
 
+### `hyper_quad.py` — the quadratic-algebra reduction: scalar functions + bilinear, no matrix function (2026-09-02, research)
+
+⚠️ 生成AI使用・要検証（research ブランチ・未監査）
+
+Every Cayley–Dickson element `x = a·e₀ + v` (v ⊥ e₀) satisfies **v² = −|v|²·e₀** — checked
+by `_mul` for M = 1..32, not assumed — so for a real-analytic f
+
+    f(a + v) = Re f(a + i|v|) + (v/|v|) · Im f(a + i|v|)
+
+and the M×M `expm/logm/funm` of `hyper_transcend.py` collapses to **1 rsqrt + 3–4 scalar
+functions + (3M+2) multiplies**: `n2 = |v|²` (bilinear) → `r = rsqrt(n2)` (n2 = 0 → 0, the
+a/0 = 0 rule, which makes the real case fall out with u = 0) → `u = v·r`, `s = n2·r` → complex
+scalar `f(a + i s)` assembled from exp/expm1/log/sqrt/rsqrt/sin/cos → `Re·e₀ + u·Im`. The
+scalar backend is pluggable: `np` (float64) or **`spec`** — the f64 coefficient-tape
+specification of [total-arith-hardware/remez](../total-arith-hardware/remez) (Remez tapes,
+≤ 0.5 ulp near mode), whose order-layer flags (GE/LE/SUNK) ride along per component
+(`QHyper.oflag`); the bilinear steps run on exact rationals and truncate to 53 bits at each
+tape entry (truncation = |shown| ≤ |true| → GE, composed by the E1 product rule). Verify-layer
+flags come from **events** only: saturation → OVER, an imaginary part dropped because u = 0
+(log/sqrt of a negative real) → CPLX, a failed defining identity → INEXACT.
+
+What was checked (`python hyper_quad.py`, `--spec` for the tape backend; both PASS):
+- **agrees with the matrix path** (same principal branch, Re > 0, |v| < π) for exp / sin / cos /
+  sinh / cosh / log / sqrt / x^½ / x^2.5, M = 1,2,4,8,16 × 12 points: worst relative
+  difference 2.6e-15 … 7.2e-15, SING/CPLX verdicts identical;
+- identities exp(log x) = x, log(exp x) = x, sqrt(x)² = x, sin²+cos² = 1, cosh²−sinh² = 1,
+  x² = x·x, (x^½)² = x at ≤ 1e-15 (5.7e-14 for sin²+cos² where cosh²|v| ≈ 25); the only
+  exemptions are the 7 cases M = 1 ∧ a < 0 where log/sqrt drop the imaginary part and say CPLX;
+- |v| → 0 continuity: f(a + v·10^-k), k = 0..20, converges monotonically to f(a)·e₀, is exact at
+  v = 0, and the flag never jumps;
+- totality: NaN / Inf / 1e±200 / 0 / MAX × 9 functions → 0 NaN, 0 exceptions;
+- `x^p` for p = m/n (n ≤ 8) is **verified** by (x^p)^n = x^m in ℝ[x] ≅ ℂ — the matrix path
+  cannot verify p = 2.5 and flags INEXACT 60/60; the reduction verifies it 60/60.
+
+Two findings the matrix path could not show:
+1. **The log of a zero divisor exists.** For the sedenion zero divisor z = e₃ + e₁₀,
+   `hlog` says SING (L_z is singular, `logm` fails) but the reduction returns
+   w = ½ln 2 + (π/4)(e₃ + e₁₀), and **exp(w) = z holds under both exps** (reduction 1e-16,
+   matrix `expm` 4e-16). The singularity of L_z is a property of the representation, not of
+   the algebra ℝ[z] ≅ ℂ that contains z. Uniqueness is not claimed; `hyper_transcend.py` keeps
+   its SING verdict until the dispatch question is decided (see below).
+2. **Order flags cannot pass through a non-monotone function of an uncertain argument.**
+   With the `spec` backend, log / sqrt / sin come out `11` (no bound, sign known) but exp and
+   cosh come out `111` (sign unknown) on every component — because s = n2·rsqrt(n2) carries
+   rsqrt's near-mode `11`, and sin(s)/cos(s) of an argument with no bound has no bound *and*
+   no sign. That is the honest order-layer answer, not a bug: the direction vocabulary has no
+   word for "within 2^-57"; carrying error width is the four-value / interval layer's job.
+
+Cost (reduction measured by the backend counters; matrix path analytic, `expm` Padé-13 with
+s = 0 squarings ≈ (6 + s + ⅓)·M³ multiply-adds — a lower bound, `funm`/`logm` cost more):
+
+| M | reduction exp (mul / add / scalar fn) | matrix expm (MACs) | gates f64 est.: reduction / matrix |
+|---|---|---|---|
+| 2 | 6 / 0 / 4 | 51 | 3.8 M / 2.9 M (matrix ×0.8) |
+| 4 | 12 / 2 / 4 | 405 | 4.0 M / 23 M (×5.7) |
+| 8 | 24 / 6 / 4 | 3,243 | 4.5 M / 185 M (×41) |
+| 16 | 48 / 14 / 4 | 25,941 | 5.5 M / 1,480 M (×270) |
+| 32 | 96 / 30 / 4 | 207,531 | 7.5 M / 11,800 M (×1,600) |
+
+Gate estimate: rsqrt = 1,536 k (measured f64, `remez/gate_logroot.py`), exp / sin / cos ≈ 687 k
+(the measured f64 exp of `remez/gate_funcs.py`; sin / cos are specified but not yet gate-built —
+assumed the same order, their heavier reduction makes the true figure higher), multiply ≈ 33 k,
+add ≈ 24 k, MAC ≈ 57 k. The crossover lies between M = 2 and M = 4 (complex numbers: a 2×2
+matrix function costs about the same as four scalar functions and, with the measured rsqrt, is
+20 % cheaper); from quaternions on the reduction wins by M³. (The first draft assumed rsqrt ≈ exp
+and put the crossover at M = 2; the measured rsqrt gate count replaced that.)
+
+Not done / open: **atan2 is outside the six tape functions** — the imaginary part of log (and
+of pow) uses float64 `atan2` with flag `11`, stated as such in the code; an atan tape (kernel
+atan(√y)/√y on y ≤ tan²(π/8) after three unit-vector half-angle steps, each one rsqrt) is the
+next piece. Whether `hyper_transcend.py` should *dispatch* CD wirings to this path (which would
+change its documented "log of a zero divisor → SING" verdict) is left to the maintainer.
+
+```bash
+python hyper_quad.py           # np backend: identity / matrix-path / continuity / zero-divisor / totality
+python hyper_quad.py --spec    # same with the (A) f64 tape spec as the scalar backend (order flags ride along)
+python hyper_quad.py --cost    # op counts per M
+```
+
 ### `total_pipeline.py` — U → V(O,N,M) → W, named
 
 External review observed that `cuda_total.py` already runs as U (entry totalization) →
@@ -405,11 +484,71 @@ sedenions; Jacobi breaks at octonions.
   operators so **existing generic code runs on it unchanged** — an ODE solver from
   OrdinaryDiffEq.jl integrates with `TotNum` and the flag names *where/which-way* the run
   left the representable range (the "used, not demo" bridge that Julia's multiple dispatch
-  makes possible and Python cannot).
+  makes possible and Python cannot). Its semantic oracle (`julia/audit_flags.jl`, 561 295
+  checks) is what forced the 2026-09-03 readings recorded in `julia/README.md`: an underflow
+  that Float64 has already collapsed to 0 is still ε = ±MIN⟦≤⟧, never 0; ℂ is sticky; and
+  **log 0 = 0** — the reserved word 0 is a value, not a limit (log x = Σ(1/n)((x−1)/x)ⁿ is 0
+  term by term under a/0 = 0), while the limit −∞ belongs to ε: log(MIN⟦≤⟧) = log MIN⟦≥⟧.
+  (The CUDA side's `log` in `cuda_total.py` is a Mercator candidate + exp-verify and marks
+  its log 0 as `INEXACT` rather than returning 0 — flagged, not silent, but not yet aligned.)
 - **`HyperTranscend.jl`** (transcendental) — `exp`/`log`/`√`/`^` for a hypercomplex number of **any** M = 2^k, all as
   `f(x) = f(Lₓ)·e₀` (matrix function of the regular representation). Forward ops are total for
   every input incl. zero divisors; only inversion breaks — where `Lₓ` is singular — and there
   it names the value (`⟦zero-divisor⟧`) instead of `NaN`. The scalar `TotNum` is the M = 1 case.
+- **`MultiF32.jl`** — **float128 / float256 / float512 (`F128` `F256` `F512`) built from Float32
+  `+ - * fma` only**, with `ScalarTot`'s flags. Not an expansion (double-double style limbs
+  hit Float32's exponent floor at ≈ 128 bits) but block floating point: 18-bit integer digits
+  in Float32 lanes + one shared exponent; fma with the constant `1.5·2⁴¹` splits products
+  exactly, 6 bits of headroom keep every column sum exact. Correctly rounded `+ − × ÷ √`
+  (exact result → nearest-even; ÷ √ = Newton candidate + exact-residual verify), 0 mismatches
+  against MPFR for all three types in `julia julia/MultiF32.jl`. Register (`NTuple`) kernels,
+  0 allocations, bit-identical to the Vector reference (`ab_multif32.jl`); the same file runs
+  unchanged as a CUDA.jl kernel, bit-identical to the CPU (`bench_multif32_cuda.jl`): on an
+  RTX 5090, F512 × at 4.7 ns and F128 × at 0.62 ns per operation — 5–21× MPFR (the C library,
+  one core) for + ×, 1.0–4.5× for ÷ √, and only 1–2 % of the GPU's FP32 peak; on the CPU it is
+  7–23× slower than MPFR for + × and 76–146× for ÷ √ (numbers and the three measured reasons
+  in `julia/README.md`).
+- **`ScalarTotComplex.jl`** — total arithmetic on ℂ (2026-09-03): a polar `TotComplex` (|z|, arg/π —
+  i·i = −1, e^{iπ}+1 = 0 and log(−1) = iπ exact) whose flags are `TotNum`'s read in ℂ — GE / LE on
+  the magnitude, the sign bit as "direction unknown" — and **arg 0 = 0 as a reserved-word
+  definition** (0 has no direction; ε = MIN⟦≤⟧∠θ carries one, so log ε = log MIN⟦≥⟧ + iθ), the
+  ℂ seat of the real type cashed in as a value (√−1 = i). Every rule is falsified against
+  `Complex{BigFloat}` truths (`audit_cplx.jl`: 931 472 checks, 0 violations; 30 definitions; the
+  real axis against `TotNum` with 0 contradictions). Details in `julia/README.md`.
+- **`MultiU32.jl`** — the same `F128` `F256` `F512` on **29-bit integer digits** (`UInt32` limbs,
+  `UInt64` columns — MPFR's limb arithmetic at the width a GPU multiplies natively, no carry
+  flag needed): same interface, flags and rounding, same MPFR battery (0 mismatches), and
+  **written for a warp**: no data-dependent tuple index, no data-dependent loop exit — barrel
+  shifters, normalize-then-round at a static bit position, selects instead of sign branches.
+  Bit-identical to its first (plain, loop-and-index) version `MultiU32Ref.jl` on 63 000 results
+  (`ab_multiu32.jl`, negative control included). ÷ and √ take their candidate from a **Newton
+  ladder in fixed point** — a step only as wide as the accuracy it produces, nothing normalized
+  or rounded between the seed and the candidate, the residual read as the low digits of the
+  product in two's complement, and √ finished by one Karp–Markstein step — which is 2.8–3.6× and
+  3.5–5.6× over the full-width Newton loop with **every result still bit-identical** (the exact
+  residual decides the last bit, the candidate only proposes it). **exp and log** (2026-09-03):
+  correctly rounded by Ziv's test in a K+2-digit working type with fallbacks at K+6 and 2K+6
+  digits (the 2P+ bits of the hard cases) and, past that, the truncated value with ⟦≥⟧ instead
+  of an exception — total by construction; MPFR bit-identity on 3 × 22 000 inputs plus the
+  constructed midpoint cases, 1.7–3.3× MPFR C on the CPU (correctly rounded in every
+  measured cell, max 0.500 ulp, where libquadmath's log reaches 0.78 and the Float64
+  expansions 5–495 ulps on their own scale), RTX 5090 F128 exp / log at 3.0 / 4.6 ns and F512
+  at 10.7 / 23.6 ns per operation — 149–296× one MPFR core, bit-identical to the CPU; the
+  semantics are `TotNum`'s
+  (log 0 = 0 the reserved word, exp(−MAX) = +MIN⟦≤⟧, log(−x) = 0⟦ℂ⟧, ℂ sticky), twin-checked at
+  16 × 16 flags × 12 values × 7 operations. CPU: 1.6–3.6× slower than MPFR
+  (the C library, same precision, same operands) for + ×, 4.6–6.6× for ÷, 2.9–5.3× for √ — and
+  slower than the Float64
+  expansions (`Double64`, `Float64x2/x4`), which are not correctly rounded and carry fewer bits
+  (`julia/bench_libs.jl`, with an accuracy check). RTX 5090, one array per field (SoA — the
+  array-of-structs layout costs 1.4–1.7× on + ×, measured): F512 + × at 0.20 / 0.29 ns per
+  operation, ÷ √ at 2.3 / 1.6 ns — 113× / 143× / 37× / 97× MPFR on one core, 21× / 16× / 36× the
+  Float32-digit version; the add within 1.3–1.6× of the measured memory bandwidth, the
+  multiply within 1.9×; `Float64x2` at 106 bits sits at the memory floor on the same GPU
+  (0.03 ns for all four operations) and `Float64x4` at 212 bits beats F256 by 1.15–3.5×
+  (`julia/README.md`; an earlier version of this line said "1.9–2.4× faster than MPFR" and
+  "950× / 750× / 85×" — that MPFR column was Julia's allocating `BigFloat` wrapper on wider
+  operands, retracted).
 
 The port below is `julia/HyperAlgebra.jl`: written against `AbstractArray` with only broadcasts
 + matmul, so the same functions run on `Array` (CPU) and are **CuArray-ready** (CUDA.jl) —
