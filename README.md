@@ -606,6 +606,14 @@ an issue reporting the result (either way) is welcome.
 
 ---
 
+**Basis convention / 基底規約 (2026-09-06).** `cd_alg(16).T` is the same Cayley–Dickson table as total-arith-hardware's `OMEGA`
+(checked: products identical to 0.0 with the index order `T[i,j,k] x_i y_j`), i.e. the XOR labelling `e_i e_j = ±e_{i XOR j}`.
+It agrees element-wise with numpy-quaternion / Quaternions.jl for quaternions, but **not** with Octonions.jl for octonions, which
+labels the imaginary units differently (same algebra, related by a signed permutation such as `p = (0,1,2,3,4,7,6,5)`,
+`s = (+,−,+,−,−,−,−,−)`). See `sed/crosscheck_external.py` in total-arith-hardware.
+`cd_alg(16).T` は total-arith-hardware の `OMEGA` と同じ表（添字順 `T[i,j,k]` で積が完全一致）。四元数は numpy-quaternion /
+Quaternions.jl と要素ごとに一致するが、八元数は Octonions.jl と基底の番号付けが違うので数値はそのままでは互換でない（同型）。
+
 ## Related repositories
 
 - **[total-arith-hardware](../../total-arith-hardware)** — the same total arithmetic + wiring, from primitive gates up to synthesizable SystemVerilog / FPGA.
